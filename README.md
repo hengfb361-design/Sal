@@ -18,7 +18,9 @@ English/Chinese/Thai/Vietnamese/Korean/Japanese/French/Spanish), speaks the
 translation with gTTS, keeps the original music/background, and muxes a new MP4
 with subtitles.
 
-This Space runs the **whole app** (frontend + API) from one container.
+There is no account to create and no history to keep: every visit opens the
+studio, uploads straight away, and hands back the finished file. This Space runs
+the **whole app** (frontend + API) from one container.
 
 ## Pipeline
 
@@ -83,8 +85,8 @@ answers with `"device":"cuda"` and the pipeline then sends it far bigger pieces
 (`AUDIO_SEPARATOR_GPU_CHUNK_SECONDS`, 90s by default) instead of the 15s pieces a
 phone needs — a CPU service keeps the phone-sized default.
 
-The app owner can also paste the URL into the `ញែកភ្លេង · Demucs API` panel in the
-studio, and that value wins over the environment variable — a phone tunnel gets a
+The URL can also be pasted into the `ញែកភ្លេង · Demucs API` panel in the studio,
+and that value wins over the environment variable — a phone tunnel gets a
 new URL every time it is reopened, so re-pointing it must not need a redeploy.
 
 ## Target language

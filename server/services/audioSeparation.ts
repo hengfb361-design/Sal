@@ -1225,7 +1225,7 @@ export interface SeparatorTestReport {
 }
 
 /**
- * End-to-end check used by the admin screen: send one short tone through the
+ * End-to-end check used by the stem panel: send one short tone through the
  * configured service and confirm two real stems come back.
  *
  * It runs the same code the pipeline runs, so whatever this reports is exactly

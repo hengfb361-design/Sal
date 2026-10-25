@@ -1,15 +1,6 @@
-import crypto from 'crypto';
 import fs from 'fs';
 import path from 'path';
-import {
-  JobRecord,
-  DialogueSegment,
-  UserRecord,
-  GoogleProfile,
-  SessionRecord,
-  UsageRecord,
-  ProPaymentRequest,
-} from '../types.js';
+import { JobRecord, DialogueSegment } from '../types.js';
 import { logger } from '../utils/logger.js';
 import { getStorage } from './storage.js';
 
@@ -18,36 +9,12 @@ export interface DatabaseProvider {
   getJob(id: string): Promise<JobRecord | null>;
   updateJob(id: string, updates: Partial<JobRecord>): Promise<JobRecord | null>;
   listJobs(limit?: number): Promise<JobRecord[]>;
-  /** Only the videos this account uploaded. */
-  listJobsForOwner(ownerId: string, limit?: number): Promise<JobRecord[]>;
   deleteJob(id: string): Promise<boolean>;
   saveSegments(jobId: string, segments: DialogueSegment[]): Promise<void>;
   getSegments(jobId: string): Promise<DialogueSegment[]>;
   /**
-   * Store an account after a Google sign-in. A returning user updates the
-   * existing record instead of piling up duplicates.
-   */
-  upsertUser(profile: GoogleProfile): Promise<UserRecord>;
-  getUser(id: string): Promise<UserRecord | null>;
-  /** Change one account (used when the owner approves a payment receipt). */
-  updateUser(id: string, patch: Partial<UserRecord>): Promise<UserRecord | null>;
-  listUsers(limit?: number): Promise<UserRecord[]>;
-  /** Manual bank-QR payments: a customer uploads a receipt, the owner decides. */
-  createProRequest(request: ProPaymentRequest): Promise<ProPaymentRequest>;
-  getProRequest(id: string): Promise<ProPaymentRequest | null>;
-  listProRequests(limit?: number): Promise<ProPaymentRequest[]>;
-  listProRequestsForUser(userId: string): Promise<ProPaymentRequest[]>;
-  updateProRequest(id: string, patch: Partial<ProPaymentRequest>): Promise<ProPaymentRequest | null>;
-  /** Mint a session token for a signed-in account. */
-  createSession(user: UserRecord): Promise<SessionRecord>;
-  getSession(token: string): Promise<SessionRecord | null>;
-  deleteSession(token: string): Promise<boolean>;
-  /** Today's video count for one account (the free daily allowance). */
-  getDailyUsage(userId: string): Promise<UsageRecord>;
-  addUsage(userId: string, durationSeconds: number): Promise<UsageRecord>;
-  /**
    * Merge in the snapshot kept in remote storage. The server calls this on boot
-   * so job history survives hosts with an ephemeral disk (e.g. Render free).
+   * so a finished job survives hosts with an ephemeral disk (e.g. Render free).
    */
   hydrateFromRemote(): Promise<void>;
   /** Upload any queued state now (called on shutdown). */
@@ -58,11 +25,6 @@ export class JsonFileDatabaseProvider implements DatabaseProvider {
   private dbPath: string;
   private jobs: Map<string, JobRecord> = new Map();
   private segments: Map<string, DialogueSegment[]> = new Map();
-  private users: Map<string, UserRecord> = new Map();
-  private sessions: Map<string, SessionRecord> = new Map();
-  private proRequests: Map<string, ProPaymentRequest> = new Map();
-  /** Keyed by account id; the record itself carries the day it belongs to. */
-  private usage: Map<string, UsageRecord> = new Map();
 
   private stateKey: string;
   private remoteTimer: ReturnType<typeof setTimeout> | null = null;
@@ -94,23 +56,7 @@ export class JsonFileDatabaseProvider implements DatabaseProvider {
             this.segments.set(id, segs as DialogueSegment[]);
           });
         }
-        if (parsed.users && Array.isArray(parsed.users)) {
-          parsed.users.forEach((u: UserRecord) => this.users.set(u.id, u));
-        }
-        if (parsed.sessions && Array.isArray(parsed.sessions)) {
-          parsed.sessions.forEach((s: SessionRecord) => this.sessions.set(s.token, s));
-        }
-        if (parsed.proRequests && Array.isArray(parsed.proRequests)) {
-          parsed.proRequests.forEach((r: ProPaymentRequest) => this.proRequests.set(r.id, r));
-        }
-        if (parsed.usage && typeof parsed.usage === 'object') {
-          Object.entries(parsed.usage).forEach(([userId, record]) =>
-            this.usage.set(userId, record as UsageRecord)
-          );
-        }
-        logger.info(
-          `Loaded ${this.jobs.size} jobs and ${this.users.size} user account(s) from database store`
-        );
+        logger.info(`Loaded ${this.jobs.size} job(s) from database store`);
       } catch (err) {
         logger.warn('Failed to parse database file, initializing empty store:', err);
       }
@@ -122,10 +68,6 @@ export class JsonFileDatabaseProvider implements DatabaseProvider {
       {
         jobs: Array.from(this.jobs.values()),
         segments: Object.fromEntries(this.segments.entries()),
-        users: Array.from(this.users.values()),
-        sessions: Array.from(this.sessions.values()),
-        proRequests: Array.from(this.proRequests.values()),
-        usage: Object.fromEntries(this.usage.entries()),
       },
       null,
       2
@@ -194,43 +136,6 @@ export class JsonFileDatabaseProvider implements DatabaseProvider {
       for (const [id, segs] of Object.entries(parsed.segments || {})) {
         if (!this.segments.has(id)) this.segments.set(id, segs as DialogueSegment[]);
       }
-      for (const user of (parsed.users || []) as UserRecord[]) {
-        const local = this.users.get(user.id);
-        const isNewer =
-          !local ||
-          new Date(user.lastLoginAt || user.createdAt).getTime() >
-            new Date(local.lastLoginAt || local.createdAt).getTime();
-        if (isNewer) {
-          this.users.set(user.id, user);
-          added++;
-        }
-      }
-      // Sessions are the promise that a signed-in browser stays signed in, so a
-      // restart must never drop them.
-      for (const session of (parsed.sessions || []) as SessionRecord[]) {
-        if (!this.sessions.has(session.token)) {
-          this.sessions.set(session.token, session);
-          added++;
-        }
-      }
-      // A receipt the owner has not seen yet must survive a restart, or a paid
-      // customer would have to be asked for the screenshot again.
-      for (const request of (parsed.proRequests || []) as ProPaymentRequest[]) {
-        const local = this.proRequests.get(request.id);
-        // A decision the owner already made wins over an older "pending" copy.
-        if (!local || local.status === 'pending') {
-          this.proRequests.set(request.id, request);
-          added++;
-        }
-      }
-      for (const [userId, record] of Object.entries((parsed.usage || {}) as Record<string, UsageRecord>)) {
-        const local = this.usage.get(userId);
-        // Same day -> keep the higher count; newer day -> keep the newer day.
-        if (!local || record.date > local.date || (record.date === local.date && record.count > local.count)) {
-          this.usage.set(userId, record);
-          added++;
-        }
-      }
       if (added > 0) {
         logger.info(`Recovered ${added} job(s) from remote storage`);
         fs.writeFileSync(this.dbPath, this.snapshot(), 'utf8');
@@ -270,10 +175,6 @@ export class JsonFileDatabaseProvider implements DatabaseProvider {
     return all.slice(0, limit);
   }
 
-  async listJobsForOwner(ownerId: string, limit: number = 50): Promise<JobRecord[]> {
-    return (await this.listJobs(Number.MAX_SAFE_INTEGER)).filter((job) => job.ownerId === ownerId).slice(0, limit);
-  }
-
   async deleteJob(id: string): Promise<boolean> {
     const deleted = this.jobs.delete(id);
     this.segments.delete(id);
@@ -292,146 +193,6 @@ export class JsonFileDatabaseProvider implements DatabaseProvider {
 
   async getSegments(jobId: string): Promise<DialogueSegment[]> {
     return this.segments.get(jobId) || [];
-  }
-
-  async upsertUser(profile: GoogleProfile): Promise<UserRecord> {
-    const now = new Date().toISOString();
-    const existing = this.users.get(profile.id);
-
-    const record: UserRecord = existing
-      ? {
-          ...existing,
-          email: profile.email || existing.email,
-          name: profile.name || existing.name,
-          picture: profile.picture || existing.picture,
-          emailVerified: profile.emailVerified || existing.emailVerified,
-          logins: (existing.logins || 1) + 1,
-          lastLoginAt: now,
-        }
-      : {
-          id: profile.id,
-          email: profile.email,
-          name: profile.name,
-          picture: profile.picture,
-          emailVerified: profile.emailVerified,
-          logins: 1,
-          createdAt: now,
-          lastLoginAt: now,
-        };
-
-    this.users.set(record.id, record);
-    this.persist();
-    logger.info(`User signed in with Google: ${record.email} (${record.logins} login(s))`);
-    return record;
-  }
-
-  async getUser(id: string): Promise<UserRecord | null> {
-    return this.users.get(id) || null;
-  }
-
-  async updateUser(id: string, patch: Partial<UserRecord>): Promise<UserRecord | null> {
-    const existing = this.users.get(id);
-    if (!existing) return null;
-    const updated = { ...existing, ...patch };
-    this.users.set(id, updated);
-    this.persist();
-    return updated;
-  }
-
-  async createProRequest(request: ProPaymentRequest): Promise<ProPaymentRequest> {
-    this.proRequests.set(request.id, { ...request });
-    this.persist();
-    return request;
-  }
-
-  async getProRequest(id: string): Promise<ProPaymentRequest | null> {
-    return this.proRequests.get(id) || null;
-  }
-
-  async listProRequests(limit: number = 100): Promise<ProPaymentRequest[]> {
-    return Array.from(this.proRequests.values())
-      .sort(
-        (a, b) => new Date(b.submittedAt).getTime() - new Date(a.submittedAt).getTime()
-      )
-      .slice(0, limit);
-  }
-
-  async listProRequestsForUser(userId: string): Promise<ProPaymentRequest[]> {
-    const mine = Array.from(this.proRequests.values()).filter((r) => r.userId === userId);
-    return mine.sort(
-      (a, b) => new Date(b.submittedAt).getTime() - new Date(a.submittedAt).getTime()
-    );
-  }
-
-  async updateProRequest(
-    id: string,
-    patch: Partial<ProPaymentRequest>
-  ): Promise<ProPaymentRequest | null> {
-    const existing = this.proRequests.get(id);
-    if (!existing) return null;
-    const updated = { ...existing, ...patch };
-    this.proRequests.set(id, updated);
-    this.persist();
-    return updated;
-  }
-
-  async createSession(user: UserRecord): Promise<SessionRecord> {
-    const now = new Date().toISOString();
-    const session: SessionRecord = {
-      token: crypto.randomBytes(32).toString('hex'),
-      userId: user.id,
-      email: user.email,
-      createdAt: now,
-      lastSeenAt: now,
-    };
-    this.sessions.set(session.token, session);
-    this.persist();
-    return session;
-  }
-
-  async getSession(token: string): Promise<SessionRecord | null> {
-    const session = this.sessions.get(token);
-    if (!session) return null;
-
-    // Touch at most once an hour so a busy client does not re-upload the store.
-    const now = Date.now();
-    if (now - new Date(session.lastSeenAt).getTime() > 3_600_000) {
-      session.lastSeenAt = new Date(now).toISOString();
-      this.persist();
-    }
-    return session;
-  }
-
-  async deleteSession(token: string): Promise<boolean> {
-    const deleted = this.sessions.delete(token);
-    if (deleted) this.persist();
-    return deleted;
-  }
-
-  async getDailyUsage(userId: string): Promise<UsageRecord> {
-    const today = new Date().toISOString().split('T')[0];
-    const stored = this.usage.get(userId);
-    if (stored && stored.date === today) return stored;
-    return { date: today, count: 0, totalDuration: 0 };
-  }
-
-  async addUsage(userId: string, durationSeconds: number): Promise<UsageRecord> {
-    const usage = await this.getDailyUsage(userId);
-    usage.count += 1;
-    usage.totalDuration += Number.isFinite(durationSeconds) ? durationSeconds : 0;
-    this.usage.set(userId, usage);
-    this.persist();
-    return usage;
-  }
-
-  async listUsers(limit: number = 200): Promise<UserRecord[]> {
-    return Array.from(this.users.values())
-      .sort(
-        (a, b) =>
-          new Date(b.lastLoginAt || b.createdAt).getTime() -
-          new Date(a.lastLoginAt || a.createdAt).getTime()
-      )
-      .slice(0, limit);
   }
 }
 

@@ -1,8 +1,6 @@
 import React, { useRef, useState } from 'react';
 import { Upload, FileVideo, CheckCircle2, AlertCircle, Sparkles, Music2, MicOff, ArrowRight } from 'lucide-react';
 import { JobSettings } from '../types';
-import { UsageIndicator } from './UsageIndicator';
-import { getUsageStats } from '../lib/usage';
 
 interface UploadPanelProps {
   onFileSelect: (file: File) => void;
@@ -14,8 +12,6 @@ interface UploadPanelProps {
   onStartDubbing: () => void;
   isUploading: boolean;
   uploadProgress: number;
-  /** The signed-in account's server-synced usage, owned by the app. */
-  usageStats?: ReturnType<typeof getUsageStats>;
   /**
    * No Demucs service is connected. Stem separation is required, so the server
    * refuses the upload — holding the button back here means the studio says why
@@ -33,7 +29,6 @@ export const UploadPanel: React.FC<UploadPanelProps> = ({
   onStartDubbing,
   isUploading,
   uploadProgress,
-  usageStats,
   startBlocked = false,
 }) => {
   const [isDragOver, setIsDragOver] = useState(false);
@@ -129,9 +124,6 @@ export const UploadPanel: React.FC<UploadPanelProps> = ({
           </div>
         </div>
       </div>
-
-      {/* Usage Indicator — this account's own counter */}
-      <UsageIndicator stats={usageStats} />
 
       {/* Selected Video Metadata Preview Card */}
       {selectedFile && (

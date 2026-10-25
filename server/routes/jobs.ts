@@ -4,8 +4,6 @@ import path from 'path';
 import fs from 'fs';
 import { getDatabase } from '../services/db.js';
 import { getStorage, resolveStoredArtifact } from '../services/storage.js';
-import { requireSession } from '../middleware/session.js';
-import { isAppOwner } from '../services/accounts.js';
 import { JobProcessor, jobEvents, KHMER_CANCELLED_MESSAGE } from '../services/jobProcessor.js';
 import {
   getAudioSeparationProvider,
@@ -72,11 +70,6 @@ const upload = multer({
  */
 router.post('/', upload.single('video'), async (req: Request, res: Response) => {
   try {
-    // Every video belongs to the account that uploaded it — that is what keeps
-    // two users' histories apart.
-    const session = await requireSession(req, res);
-    if (!session) return;
-
     if (!req.file) {
       return res.status(400).json({ error: 'សូមជ្រើសរើសវីដេអូដើម្បីបញ្ចូល។ (No video file provided)' });
     }
@@ -144,8 +137,6 @@ router.post('/', upload.single('video'), async (req: Request, res: Response) => 
 
     const newJob: JobRecord = {
       id: jobId,
-      ownerId: session.userId,
-      ownerEmail: session.email,
       status: 'queued',
       progress: 5,
       message: 'Job queued...',
@@ -159,11 +150,6 @@ router.post('/', upload.single('video'), async (req: Request, res: Response) => 
     };
 
     await db.createJob(newJob);
-
-    // Count the video against this account's daily allowance. The server is the
-    // one keeping score, so switching devices or clearing a browser cannot reset
-    // the free tier.
-    await db.addUsage(session.userId, Number(meta?.duration) || 0);
 
     // Trigger asynchronous processing pipeline
     setImmediate(() => {
@@ -188,50 +174,14 @@ router.post('/', upload.single('video'), async (req: Request, res: Response) => 
 });
 
 /**
- * GET /api/jobs
- * List recent jobs
- */
-router.get('/', async (req: Request, res: Response) => {
-  try {
-    const session = await requireSession(req, res);
-    if (!session) return;
-
-    const db = getDatabase();
-    const limit = parseInt(req.query.limit as string || '20', 10);
-    let jobs = await db.listJobsForOwner(session.userId, limit);
-
-    // Videos uploaded before accounts existed belong to nobody. They stay with
-    // the app owner rather than leaking into every new account.
-    if (await isAppOwner(session)) {
-      const legacy = (await db.listJobs(1000)).filter((job) => !job.ownerId);
-      const seen = new Set(jobs.map((job) => job.id));
-      jobs = [...jobs, ...legacy.filter((job) => !seen.has(job.id))]
-        .sort((a, b) => new Date(b.createdAt).getTime() - new Date(a.createdAt).getTime())
-        .slice(0, limit);
-    }
-
-    return res.json({
-      jobs,
-      account: { id: session.userId, email: session.email },
-    });
-  } catch (err: any) {
-    return res.status(500).json({ error: 'Failed to list jobs' });
-  }
-});
-
-/**
  * GET /api/jobs/:id
  * Get single job details
  */
 router.get('/:id', async (req: Request, res: Response) => {
   try {
-    const session = await requireSession(req, res);
-    if (!session) return;
-
     const db = getDatabase();
     const job = await db.getJob(req.params.id);
-    // Another account's job is simply "not found" — never someone else's video.
-    if (!job || (job.ownerId && job.ownerId !== session.userId)) {
+    if (!job) {
       return res.status(404).json({ error: 'រកមិនឃើញការងារនេះទេ។ (Job not found)' });
     }
     return res.json(job);
@@ -245,14 +195,11 @@ router.get('/:id', async (req: Request, res: Response) => {
  * Server-Sent Events for real-time progress updates
  */
 router.get('/:id/events', async (req: Request, res: Response) => {
-  const session = await requireSession(req, res);
-  if (!session) return;
-
   const jobId = req.params.id;
   const db = getDatabase();
   const job = await db.getJob(jobId);
 
-  if (!job || (job.ownerId && job.ownerId !== session.userId)) {
+  if (!job) {
     return res.status(404).json({ error: 'Job not found' });
   }
 
@@ -290,13 +237,10 @@ router.get('/:id/events', async (req: Request, res: Response) => {
  */
 router.get('/:id/download', async (req: Request, res: Response) => {
   try {
-    const session = await requireSession(req, res);
-    if (!session) return;
-
     const db = getDatabase();
     const job = await db.getJob(req.params.id);
 
-    if (!job || (job.ownerId && job.ownerId !== session.userId)) {
+    if (!job) {
       return res.status(404).send('Job not found');
     }
 
@@ -366,12 +310,9 @@ router.get('/:id/download', async (req: Request, res: Response) => {
  */
 router.get('/:id/subtitles', async (req: Request, res: Response) => {
   try {
-    const session = await requireSession(req, res);
-    if (!session) return;
-
     const db = getDatabase();
     const job = await db.getJob(req.params.id);
-    if (!job || (job.ownerId && job.ownerId !== session.userId)) {
+    if (!job) {
       return res.status(404).send('Job not found');
     }
 
@@ -398,12 +339,9 @@ router.get('/:id/subtitles', async (req: Request, res: Response) => {
  */
 router.get('/:id/audio', async (req: Request, res: Response) => {
   try {
-    const session = await requireSession(req, res);
-    if (!session) return;
-
     const db = getDatabase();
     const job = await db.getJob(req.params.id);
-    if (!job || (job.ownerId && job.ownerId !== session.userId)) {
+    if (!job) {
       return res.status(404).send('Job not found');
     }
     const audioFile = await resolveStoredArtifact(job.outputAudioFile);
@@ -419,72 +357,10 @@ router.get('/:id/audio', async (req: Request, res: Response) => {
   }
 });
 
-/**
- * Every stored artefact a job owns, as the (category, filename) pairs the storage
- * layer understands. `status` in the record only names the local paths it wrote,
- * so the file name is what both the local disk and R2 buckets are keyed by.
- */
-function jobArtifacts(job: JobRecord): { category: 'uploads' | 'outputs'; filename: string }[] {
-  const files: { category: 'uploads' | 'outputs'; filename: string }[] = [];
-
-  const add = (category: 'uploads' | 'outputs', stored?: string) => {
-    if (!stored) return;
-    const filename = path.basename(stored.split('?')[0]);
-    if (filename) files.push({ category, filename });
-  };
-
-  add('uploads', job.inputFile);
-  add('outputs', job.outputFile);
-  add('outputs', job.outputFileClean);
-  add('outputs', job.outputAudioFile);
-  add('outputs', job.outputSubtitlesSrt);
-  add('outputs', job.outputSubtitlesVtt);
-
-  return files;
-}
-
 /** A job still being processed writes into its directories, so never delete it. */
 function isBusy(job: JobRecord): boolean {
   return job.status !== 'completed' && job.status !== 'failed';
 }
-
-/**
- * DELETE /api/jobs
- * Clear this account's whole history — the finished jobs only. Anything still
- * running is left alone so the pipeline can finish writing its result.
- * Admin sees own + legacy (pre-account) jobs, same as GET /, so clearing
- * actually removes what the admin is looking at.
- */
-router.delete('/', async (req: Request, res: Response) => {
-  try {
-    const session = await requireSession(req, res);
-    if (!session) return;
-
-    const db = getDatabase();
-    let pending = await db.listJobsForOwner(session.userId, Number.MAX_SAFE_INTEGER);
-    if (await isAppOwner(session)) {
-      const legacy = (await db.listJobs(1000)).filter((job) => !job.ownerId);
-      const seen = new Set(pending.map((job) => job.id));
-      pending = [...pending, ...legacy.filter((job) => !seen.has(job.id))];
-    }
-    const removable = pending.filter((job) => !isBusy(job));
-
-    const storage = getStorage();
-    for (const job of removable) {
-      for (const { category, filename } of jobArtifacts(job)) {
-        await storage.deleteFile(category, filename);
-      }
-      await storage.cleanProcessingDir(job.id);
-      await db.deleteJob(job.id);
-    }
-
-    logger.info(`Cleared ${removable.length} job(s) from ${session.email}'s history (admin=${await isAppOwner(session)})`);
-    return res.json({ ok: true, deleted: removable.length, skipped: pending.length - removable.length });
-  } catch (err: any) {
-    logger.error('Failed to clear history:', err);
-    return res.status(500).json({ error: 'មិនអាចសម្អាតប្រវត្តិបានទេ។ សូមព្យាយាមម្តងទៀត។' });
-  }
-});
 
 /**
  * POST /api/jobs/:id/cancel
@@ -498,12 +374,9 @@ router.delete('/', async (req: Request, res: Response) => {
  */
 router.post('/:id/cancel', async (req: Request, res: Response) => {
   try {
-    const session = await requireSession(req, res);
-    if (!session) return;
-
     const db = getDatabase();
     const job = await db.getJob(req.params.id);
-    if (!job || (job.ownerId && job.ownerId !== session.userId)) {
+    if (!job) {
       return res.status(404).json({ error: 'រកមិនឃើញការងារនេះទេ។ (Job not found)' });
     }
     if (!isBusy(job)) {
@@ -530,54 +403,11 @@ router.post('/:id/cancel', async (req: Request, res: Response) => {
       return res.json({ ok: true, status: 'failed', cancelled: true });
     }
 
-    logger.info(`Cancel requested for job ${job.id} by ${session.email}`);
+    logger.info(`Cancel requested for job ${job.id} by the studio`);
     return res.json({ ok: true, cancelling: true });
   } catch (err: any) {
     logger.error('Failed to cancel job:', err);
     return res.status(500).json({ error: 'មិនអាចបោះបង់ការងារនេះបានទេ។' });
-  }
-});
-
-/**
- * DELETE /api/jobs/:id
- * Forget one history entry and free the files behind it.
- *
- * Videos uploaded before accounts existed belong to nobody, so only the app
- * owner may clear those — everyone else would be able to delete someone's work.
- */
-router.delete('/:id', async (req: Request, res: Response) => {
-  try {
-    const session = await requireSession(req, res);
-    if (!session) return;
-
-    const db = getDatabase();
-    const job = await db.getJob(req.params.id);
-
-    if (!job) {
-      return res.status(404).json({ error: 'រកមិនឃើញការងារនេះទេ។ (Job not found)' });
-    }
-    const owned = job.ownerId ? job.ownerId === session.userId : await isAppOwner(session);
-    if (!owned) {
-      return res.status(404).json({ error: 'រកមិនឃើញការងារនេះទេ។ (Job not found)' });
-    }
-    if (isBusy(job)) {
-      return res.status(409).json({
-        error: 'ការងារនេះកំពុងដំណើរការ សូមរង់ចាំឲ្យចប់សិន។ (This job is still processing)',
-      });
-    }
-
-    const storage = getStorage();
-    for (const { category, filename } of jobArtifacts(job)) {
-      await storage.deleteFile(category, filename);
-    }
-    await storage.cleanProcessingDir(job.id);
-    await db.deleteJob(job.id);
-
-    logger.info(`Deleted job ${job.id} (${job.originalFilename || 'unnamed'}) for ${session.email}`);
-    return res.json({ ok: true, deleted: 1 });
-  } catch (err: any) {
-    logger.error('Failed to delete job:', err);
-    return res.status(500).json({ error: 'មិនអាចលុបការងារនេះបានទេ។ សូមព្យាយាមម្តងទៀត។' });
   }
 });
 

@@ -2,9 +2,6 @@ import express, { Request, Response } from 'express';
 import fs from 'fs';
 import os from 'os';
 import path from 'path';
-import { requireSession } from '../middleware/session.js';
-import { isAppOwner } from '../services/accounts.js';
-import { SessionRecord } from '../types.js';
 import { FFmpegHelper } from '../utils/ffmpeg.js';
 import { logger } from '../utils/logger.js';
 import {
@@ -29,29 +26,6 @@ import {
 
 const router = express.Router();
 
-/**
- * The stem service is infrastructure, not a per-account feature: only the app
- * owner may look at it or change where the pipeline sends audio.
- *
- * `isAppOwner` is the right check here, not the bare `OWNER_EMAILS` allowlist:
- * it is the same answer the account already gets from `/api/usage`, and a
- * deployment that never set `OWNER_EMAILS` still has exactly one owner (the
- * first account) — otherwise the panel would be visible but every request from
- * it would come back 403, which is precisely the setup the owner needs to be
- * able to do alone.
- */
-async function requireAdmin(req: Request, res: Response): Promise<SessionRecord | null> {
-  const session = await requireSession(req, res);
-  if (!session) return null;
-  if (!(await isAppOwner(session))) {
-    res.status(403).json({
-      error: 'តែគណនី Admin ទេដែលអាចកំណត់ម៉ាស៊ីនញែកភ្លេងបាន។ (Admin only.)',
-    });
-    return null;
-  }
-  return session;
-}
-
 /** Never send the key itself to a browser — only whether one is stored. */
 function describeConnection() {
   const connection = getSeparatorConnection();
@@ -73,9 +47,6 @@ function describeConnection() {
  * What the pipeline is currently using, and which provider it resolved to.
  */
 router.get('/', async (req: Request, res: Response) => {
-  const session = await requireAdmin(req, res);
-  if (!session) return;
-
   res.json(describeConnection());
 });
 
@@ -87,9 +58,6 @@ router.get('/', async (req: Request, res: Response) => {
  * already saved, which is what makes re-pointing a phone tunnel a one-field edit.
  */
 router.put('/', async (req: Request, res: Response) => {
-  const session = await requireAdmin(req, res);
-  if (!session) return;
-
   // Whatever Colab printed, pasted whole: the label (`URL : …`), quotes and a
   // missing scheme are all handled by the shared normaliser, so a bare
   // `xxxx.trycloudflare.com` is a valid answer here.
@@ -107,7 +75,7 @@ router.put('/', async (req: Request, res: Response) => {
       model: req.body?.model === undefined ? undefined : String(req.body.model).trim(),
       path: req.body?.path === undefined ? undefined : String(req.body.path).trim(),
     });
-    logger.info(`Stem service set to ${saved.url} by ${session.email}`);
+    logger.info(`Stem service set to ${saved.url}`);
     return res.json(describeConnection());
   } catch (err: any) {
     logger.error('Failed to save the stem service connection:', err);
@@ -120,11 +88,8 @@ router.put('/', async (req: Request, res: Response) => {
  * Forget the website override and fall back to the deployment's env vars.
  */
 router.delete('/', async (req: Request, res: Response) => {
-  const session = await requireAdmin(req, res);
-  if (!session) return;
-
   await clearSeparatorConnection();
-  logger.info(`Stem service override cleared by ${session.email}`);
+  logger.info(`Stem service override cleared`);
   res.json(describeConnection());
 });
 
@@ -162,9 +127,6 @@ async function createTestTone(targetDir: string): Promise<string> {
  * of failure a plain probe hides.
  */
 router.post('/test', async (req: Request, res: Response) => {
-  const session = await requireAdmin(req, res);
-  if (!session) return;
-
   const connection = getSeparatorConnection();
   if (!connection.url) {
     return res.status(400).json({
@@ -183,7 +145,7 @@ router.post('/test', async (req: Request, res: Response) => {
 
     if (!service) {
       logger.info(
-        `Stem service quick test by ${session.email}: unreachable (${latencyMs}ms) ${connection.url}`
+        `Stem service quick test: unreachable (${latencyMs}ms) ${connection.url}`
       );
       return res.json({
         ok: false,
@@ -197,7 +159,7 @@ router.post('/test', async (req: Request, res: Response) => {
 
     if (looksLikeTranslationService(service)) {
       logger.info(
-        `Stem service quick test by ${session.email}: wrong service (${connection.url})`
+        `Stem service quick test: wrong service (${connection.url})`
       );
       return res.json({
         ok: false,
@@ -215,7 +177,7 @@ router.post('/test', async (req: Request, res: Response) => {
     const auth = await probeStemServiceKey(connection.url, connection.apiKey);
     if (auth === 'rejected') {
       logger.info(
-        `Stem service quick test by ${session.email}: key rejected (${latencyMs}ms) ${connection.url}`
+        `Stem service quick test: key rejected (${latencyMs}ms) ${connection.url}`
       );
       return res.json({
         ok: false,
@@ -227,7 +189,7 @@ router.post('/test', async (req: Request, res: Response) => {
     }
 
     logger.info(
-      `Stem service quick test by ${session.email}: ok (${latencyMs}ms) ${service} — ${connection.url}`
+      `Stem service quick test: ok (${latencyMs}ms) ${service} — ${connection.url}`
     );
     return res.json({
       ok: true,
@@ -243,7 +205,7 @@ router.post('/test', async (req: Request, res: Response) => {
     const service = await describeRemoteService(connection.url, connection.apiKey).catch(() => null);
     if (looksLikeTranslationService(service)) {
       logger.info(
-        `Stem service full test by ${session.email}: wrong service (${connection.url})`
+        `Stem service full test: wrong service (${connection.url})`
       );
       return res.json({
         ok: false,
@@ -257,7 +219,7 @@ router.post('/test', async (req: Request, res: Response) => {
     // Fail before spending a whole upload on audio the service will refuse.
     const auth = await probeStemServiceKey(connection.url, connection.apiKey);
     if (auth === 'rejected') {
-      logger.info(`Stem service full test by ${session.email}: key rejected ${connection.url}`);
+      logger.info(`Stem service full test: key rejected ${connection.url}`);
       return res.json({
         ok: false,
         service,
@@ -271,7 +233,7 @@ router.post('/test', async (req: Request, res: Response) => {
     const report: SeparatorTestReport = await testRemoteSeparation(tone, tempDir);
 
     logger.info(
-      `Stem service test by ${session.email}: ${report.ok ? 'ok' : 'failed'} (${report.latencyMs}ms) ${report.detail}`
+      `Stem service test: ${report.ok ? 'ok' : 'failed'} (${report.latencyMs}ms) ${report.detail}`
     );
 
     return res.json({ ...report, service: report.service ?? service, url: connection.url });

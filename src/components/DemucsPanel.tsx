@@ -28,8 +28,6 @@ import {
 } from '@/server/utils/serviceConnection';
 
 interface DemucsPanelProps {
-  /** Only the app owner sees this: the stem service belongs to the whole app. */
-  visible: boolean;
   /**
    * The connection changed (saved, tested or cleared). The studio listens so its
    * "Demucs is required" notice clears the moment a service is connected, without
@@ -54,7 +52,7 @@ function formatBytes(bytes: number): string {
 }
 
 /**
- * Admin setup for the model that pulls the voice out of a video before dubbing.
+ * Setup for the model that pulls the voice out of a video before dubbing.
  *
  * The address lives here rather than only in environment variables because a
  * phone served over a quick tunnel gets a new URL every time the tunnel is
@@ -63,7 +61,7 @@ function formatBytes(bytes: number): string {
  * does anything: there is no key and no model to choose, because the phone's
  * Demucs service takes neither.
  */
-export const DemucsPanel: React.FC<DemucsPanelProps> = ({ visible, onConnectionChange }) => {
+export const DemucsPanel: React.FC<DemucsPanelProps> = ({ onConnectionChange }) => {
   const [connection, setConnection] = useState<SeparatorConnectionView | null>(null);
   const [url, setUrl] = useState('');
   /**
@@ -82,7 +80,6 @@ export const DemucsPanel: React.FC<DemucsPanelProps> = ({ visible, onConnectionC
   };
 
   useEffect(() => {
-    if (!visible) return;
     let cancelled = false;
 
     void (async () => {
@@ -104,9 +101,7 @@ export const DemucsPanel: React.FC<DemucsPanelProps> = ({ visible, onConnectionC
     return () => {
       cancelled = true;
     };
-  }, [visible]);
-
-  if (!visible) return null;
+  }, []);
 
   const pinned = connection?.source === 'pinned';
 

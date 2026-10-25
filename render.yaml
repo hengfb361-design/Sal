@@ -66,23 +66,3 @@ services:
         sync: false
       - key: S3_SECRET_ACCESS_KEY
         sync: false
-
-      # Billing (LemonSqueezy). The API key is read-only and lets the server
-      # resolve the checkout URL itself, so no buy link has to be hardcoded.
-      - key: LEMONSQUEEZY_API_KEY
-        sync: false
-      - key: LEMONSQUEEZY_STORE_ID
-        sync: false
-      # Signing secret from LemonSqueezy -> Settings -> Webhooks. Without it the
-      # webhook is refused and purchases are confirmed by email instead.
-      - key: LEMONSQUEEZY_WEBHOOK_SECRET
-        sync: false
-      # Where buyers land after paying (used for the checkout redirect).
-      - key: PUBLIC_APP_URL
-        value: https://aivideotranslate.dev
-
-      # Admin / owner accounts (comma separated). These get the full user list
-      # and run without the free plan's 2-videos-a-day cap. Without this the
-      # account that signed up first is treated as the owner.
-      - key: OWNER_EMAILS
-        value: kitreaksa78@gmail.com,kitreaksa78@gmail.com

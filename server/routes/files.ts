@@ -2,7 +2,6 @@ import express, { Request, Response } from 'express';
 import fs from 'fs';
 import path from 'path';
 import { getStorage } from '../services/storage.js';
-import { requireSession } from '../middleware/session.js';
 import { logger } from '../utils/logger.js';
 
 const router = express.Router();
@@ -13,10 +12,6 @@ const router = express.Router();
  */
 router.get('/:category/:filename', async (req: Request, res: Response) => {
   try {
-    // Media files are streamed with the signed-in account's token, never openly.
-    const session = await requireSession(req, res);
-    if (!session) return;
-
     const { category, filename } = req.params;
     if (!['uploads', 'processing', 'outputs'].includes(category)) {
       return res.status(400).send('Invalid category');
