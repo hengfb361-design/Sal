@@ -1,13 +1,9 @@
 import fs from 'fs';
 import os from 'os';
 import path from 'path';
-import { GoogleGenAI, Modality } from '@google/genai';
-import { MsEdgeTTS, OUTPUT_FORMAT } from 'msedge-tts';
-import { DialogueSegment, JobSettings, TargetLanguage } from '../types.js';
+import { TargetLanguage } from '../types.js';
 import { logger } from '../utils/logger.js';
 import { FFmpegHelper } from '../utils/ffmpeg.js';
-import { withRetry } from '../utils/retry.js';
-import { getGeminiApiKey } from '../utils/aiKeys.js';
 
 export interface TTSOptions {
   gender?: 'male' | 'female' | 'neutral';
@@ -41,231 +37,200 @@ export interface TTSProvider {
 /** The target that old jobs and missing values fall back to. */
 const DEFAULT_TTS_LANGUAGE = 'km';
 
+/** The label the settings card shows for the voice engine. */
+export const GTTS_MODEL = 'Google Translate TTS (gTTS)';
+
 /**
- * What each target language is called in a Gemini TTS prompt.
- *
- * Gemini's prebuilt voices are not tied to a language, so the instruction is
- * what steers the pronunciation. The Khmer entry keeps the wording this project
- * shipped with, so dubbing into Khmer sounds exactly as it did before the target
- * picker existed.
+ * The language codes `translate_tts` expects. Same as Google Translate's, so
+ * Mandarin is `zh-CN` and everything else keeps the studio's own code.
  */
-const GEMINI_SPOKEN_LANGUAGES: Record<string, { native: string; spoken: string }> = {
-  km: { native: 'Cambodian', spoken: 'Khmer' },
-  en: { native: 'American', spoken: 'English' },
-  zh: { native: 'Mandarin Chinese', spoken: 'Mandarin Chinese' },
-  th: { native: 'Thai', spoken: 'Thai' },
-  vi: { native: 'Vietnamese', spoken: 'Vietnamese' },
-  ko: { native: 'Korean', spoken: 'Korean' },
-  ja: { native: 'Japanese', spoken: 'Japanese' },
-  fr: { native: 'French', spoken: 'French' },
-  es: { native: 'Spanish', spoken: 'Spanish' },
+const GTTS_LANGUAGE_CODES: Record<string, string> = {
+  km: 'km',
+  en: 'en',
+  zh: 'zh-CN',
+  th: 'th',
+  vi: 'vi',
+  ko: 'ko',
+  ja: 'ja',
+  fr: 'fr',
+  es: 'es',
 };
 
 /**
- * Edge neural voices per target language (female / male).
+ * The endpoint gTTS wraps: one MP3 per request, no key, no model download.
  *
- * Edge is the keyless engine and has a neural voice for every language the
- * studio offers, so the dub speaks the chosen target instead of always Khmer.
- * `EDGE_TTS_VOICE_FEMALE_<CODE>` / `EDGE_TTS_VOICE_MALE_<CODE>` override one
- * language; the older `EDGE_TTS_VOICE_FEMALE` / `EDGE_TTS_VOICE_MALE` still
- * override the default (Khmer) pair exactly as before.
+ * Two hosts, same service — a throttled host (429) is skipped for the next
+ * attempt instead of costing the line its voice.
  */
-const EDGE_VOICES: Record<string, { female: string; male: string }> = {
-  km: { female: 'km-KH-SreymomNeural', male: 'km-KH-PisethNeural' },
-  en: { female: 'en-US-AriaNeural', male: 'en-US-GuyNeural' },
-  zh: { female: 'zh-CN-XiaoxiaoNeural', male: 'zh-CN-YunxiNeural' },
-  th: { female: 'th-TH-PremwadeeNeural', male: 'th-TH-NiwatNeural' },
-  vi: { female: 'vi-VN-HoaiMyNeural', male: 'vi-VN-NamMinhNeural' },
-  ko: { female: 'ko-KR-SunHiNeural', male: 'ko-KR-InJoonNeural' },
-  ja: { female: 'ja-JP-NanamiNeural', male: 'ja-JP-KeitaNeural' },
-  fr: { female: 'fr-FR-DeniseNeural', male: 'fr-FR-HenriNeural' },
-  es: { female: 'es-ES-ElviraNeural', male: 'es-ES-AlvaroNeural' },
-};
+const GTTS_HOSTS = ['translate.google.com', 'translate.googleapis.com'];
 
-/** The Edge voice for a target language and gender, honouring the env overrides. */
-function edgeVoice(language: string | undefined, gender: 'male' | 'female'): string {
-  const code = (language || '').trim().toLowerCase() || DEFAULT_TTS_LANGUAGE;
-  const pair = EDGE_VOICES[code] || EDGE_VOICES[DEFAULT_TTS_LANGUAGE];
-  const perLanguage = (
-    process.env[`EDGE_TTS_VOICE_${gender.toUpperCase()}_${code.toUpperCase()}`] || ''
-  ).trim();
-  if (perLanguage) return perLanguage;
-  if (code === DEFAULT_TTS_LANGUAGE) {
-    const generic = (process.env[`EDGE_TTS_VOICE_${gender.toUpperCase()}`] || '').trim();
-    if (generic) return generic;
-  }
-  return gender === 'male' ? pair.male : pair.female;
-}
+/**
+ * How much text one request may carry.
+ *
+ * `translate_tts` rejects long queries (gTTS itself splits at ~100 characters),
+ * so a line longer than this is cut into pieces that are joined back into one
+ * WAV below. Cutting at punctuation/spaces keeps the seam between two requests
+ * inside a natural pause.
+ */
+const GTTS_MAX_CHARS = Number(process.env.GTTS_MAX_CHARS || '180');
 
-/** Escape text before it is embedded into the SSML request body. */
-function escapeSsml(text: string): string {
-  return text
-    .replace(/&/g, '&amp;')
-    .replace(/</g, '&lt;')
-    .replace(/>/g, '&gt;')
-    .replace(/"/g, '&quot;')
-    .replace(/'/g, '&apos;');
+const GTTS_TIMEOUT_MS = Number(process.env.GTTS_TIMEOUT_MS || '20000');
+const GTTS_MAX_ATTEMPTS = Math.max(1, Number(process.env.GTTS_MAX_ATTEMPTS || '4'));
+const GTTS_RETRY_BACKOFF_MS = Math.max(0, Number(process.env.GTTS_RETRY_BACKOFF_MS || '900'));
+
+const GTTS_USER_AGENT =
+  'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0 Safari/537.36';
+
+/** The gTTS code for a target language; unknown values speak Khmer. */
+export function gttsLanguageCode(language: string | undefined): string {
+  const key = (language || '').trim().toLowerCase();
+  return GTTS_LANGUAGE_CODES[key] || GTTS_LANGUAGE_CODES[DEFAULT_TTS_LANGUAGE];
 }
 
 /**
- * Gemini Text-to-Speech Provider using gemini-3.1-flash-tts-preview
- * Supports Cambodian Khmer language, male and female voices, emotional tone and natural pacing.
+ * Split one dialogue line into the pieces a single `translate_tts` request can
+ * carry.
+ *
+ * The split is made after sentence/clause punctuation first and only hard-cuts a
+ * piece that has none, so the two requests are never joined mid-phrase when the
+ * text gives any choice. Khmer words are not space-separated, so a very long
+ * Khmer line is the one case that can be cut mid-word — the alternative is
+ * losing the line entirely.
  */
-export class GeminiTTSProvider implements TTSProvider {
-  name = 'gemini';
-  private client: GoogleGenAI | null = null;
-  private modelName: string;
+export function splitForGoogleTts(
+  text: string,
+  maxChars = Number.isFinite(GTTS_MAX_CHARS) && GTTS_MAX_CHARS >= 20 ? GTTS_MAX_CHARS : 180
+): string[] {
+  const clean = (text || '').replace(/\s+/g, ' ').trim();
+  if (!clean) return [];
 
-  constructor() {
-    this.modelName = process.env.TTS_MODEL || 'gemini-3.1-flash-tts-preview';
-    const apiKey = process.env.TTS_API_KEY || getGeminiApiKey();
-    if (apiKey) {
-      this.client = new GoogleGenAI({
-        apiKey,
-        httpOptions: {
-          headers: {
-            'User-Agent': 'aistudio-build',
-          },
-        },
-      });
+  const clauses = clean.match(/[^.!?…។៕,;:]+[.!?…។៕,;:]?/g) || [clean];
+  const pieces: string[] = [];
+  let current = '';
+
+  const flush = () => {
+    if (current.trim()) pieces.push(current.trim());
+    current = '';
+  };
+
+  for (const clause of clauses) {
+    const piece = clause.trim();
+    if (!piece) continue;
+
+    if (piece.length > maxChars) {
+      flush();
+      for (let i = 0; i < piece.length; i += maxChars) {
+        const slice = piece.slice(i, i + maxChars).trim();
+        if (slice) pieces.push(slice);
+      }
+      continue;
     }
+
+    if (`${current} ${piece}`.trim().length > maxChars) flush();
+    current = `${current} ${piece}`.trim();
   }
 
-  isConfigured(): boolean {
-    return Boolean(process.env.TTS_API_KEY || getGeminiApiKey());
+  flush();
+  return pieces;
+}
+
+class GttsRequestError extends Error {
+  constructor(message: string, readonly status?: number) {
+    super(message);
+    this.name = 'GttsRequestError';
   }
+}
 
-  getModelName(): string {
-    return this.modelName;
-  }
+/** One `translate_tts` request. No retry — the caller owns the rotation. */
+async function requestGttsAudio(
+  host: string,
+  text: string,
+  language: string
+): Promise<Buffer> {
+  const params = new URLSearchParams({
+    ie: 'UTF-8',
+    client: 'tw-ob',
+    tl: language,
+    ttsspeed: '1',
+    q: text,
+  });
 
-  async synthesizeSpeech(
-    text: string,
-    outputPath: string,
-    options: TTSOptions
-  ): Promise<TTSResult> {
-    if (!this.client) {
-      throw new Error('TTS Provider Gemini is not configured. Missing API key.');
-    }
-
-    const cleanText = text.trim();
-    if (!cleanText) {
-      throw new Error('Cannot synthesize empty speech text.');
-    }
-
-    // Voice assignment: Male vs Female
-    // Available Gemini TTS prebuilt voices: 'Puck', 'Charon', 'Kore', 'Fenrir', 'Zephyr'
-    let voiceName = 'Puck'; // male default
-    if (options.gender === 'female') {
-      voiceName = 'Kore'; // female default
-    } else if (options.gender === 'neutral') {
-      voiceName = 'Zephyr';
-    }
-
-    const emotionInstruction = options.emotion && options.emotion !== 'neutral'
-      ? `with a ${options.emotion} emotional tone`
-      : 'with a natural, friendly tone';
-
-    const spoken = GEMINI_SPOKEN_LANGUAGES[(options.language || '').trim().toLowerCase()] || GEMINI_SPOKEN_LANGUAGES.km;
-
-    // Direct sentence-level prompt for natural dubbing pronunciation in the
-    // job's target language (Khmer unless the studio chose another one).
-    const prompt = `Say naturally as a native ${spoken.native} speaker in natural spoken ${spoken.spoken} (${emotionInstruction}): "${cleanText}"`;
-
-    const rawWavPath = outputPath.replace(/\.wav$/, '_raw.wav');
-
-    await withRetry(
-      async () => {
-        const response = await this.client!.models.generateContent({
-          model: this.modelName,
-          contents: [{ parts: [{ text: prompt }] }],
-          config: {
-            responseModalities: [Modality.AUDIO],
-            speechConfig: {
-              voiceConfig: {
-                prebuiltVoiceConfig: { voiceName },
-              },
-            },
-          },
-        });
-
-        // Gemini TTS returns base64 PCM/audio data in candidates[0].content.parts[0].inlineData.data
-        const audioPart = response.candidates?.[0]?.content?.parts?.[0]?.inlineData;
-        if (!audioPart || !audioPart.data) {
-          throw new Error('No audio data received from Gemini TTS service.');
-        }
-
-        const audioBuffer = Buffer.from(audioPart.data, 'base64');
-        const mimeType = audioPart.mimeType || 'audio/wav';
-
-        // Check if raw PCM or WAV container
-        if (mimeType.includes('pcm')) {
-          // Wrap raw 24kHz 16-bit mono PCM into standard WAV using FFmpeg
-          const tempPcm = outputPath.replace(/\.wav$/, '.pcm');
-          fs.writeFileSync(tempPcm, audioBuffer);
-          await FFmpegHelper.execute([
-            '-y',
-            '-f', 's16le',
-            '-ar', '24000',
-            '-ac', '1',
-            '-i', tempPcm,
-            '-ar', '44100',
-            rawWavPath,
-          ]);
-          if (fs.existsSync(tempPcm)) fs.unlinkSync(tempPcm);
-        } else {
-          fs.writeFileSync(rawWavPath, audioBuffer);
-        }
+  let response: Response;
+  try {
+    response = await fetch(`https://${host}/translate_tts?${params.toString()}`, {
+      headers: {
+        'User-Agent': GTTS_USER_AGENT,
+        Accept: 'audio/mpeg,audio/*;q=0.9,*/*;q=0.8',
+        Referer: 'https://translate.google.com/',
       },
-      { operationName: 'Gemini Khmer Speech Synthesis' }
-    );
-
-    // The line is used exactly as the engine produced it. It is no longer sped
-    // up or trimmed to fit the original slot — that per-line FFmpeg pass was the
-    // "audio must match the video" step, and dropping it removes two encodes per
-    // line. The voice is still placed on its own timestamp when the tracks are
-    // assembled, so lines start where they should without being squeezed.
-    fs.copyFileSync(rawWavPath, outputPath);
-
-    if (fs.existsSync(rawWavPath)) {
-      try { fs.unlinkSync(rawWavPath); } catch {}
-    }
-
-    const finalDuration = await FFmpegHelper.getAudioDuration(outputPath);
-    return {
-      audioPath: outputPath,
-      duration: finalDuration,
-    };
+      signal: AbortSignal.timeout(GTTS_TIMEOUT_MS),
+    });
+  } catch (err: any) {
+    const reason = err?.name === 'TimeoutError' ? 'timed out' : err?.message || 'network error';
+    throw new GttsRequestError(`Google TTS request failed (${reason}).`);
   }
+
+  if (!response.ok) {
+    await response.text().catch(() => '');
+    throw new GttsRequestError(`Google TTS answered ${response.status}.`, response.status);
+  }
+
+  const audio = Buffer.from(await response.arrayBuffer());
+  if (audio.length === 0) {
+    throw new GttsRequestError('Google TTS returned no audio.');
+  }
+  return audio;
+}
+
+/** Download one line's audio, rotating hosts and backing off on a throttle. */
+async function fetchSpeech(
+  text: string,
+  language: string,
+  destinationPath: string
+): Promise<void> {
+  let lastError: unknown;
+  for (let attempt = 1; attempt <= GTTS_MAX_ATTEMPTS; attempt++) {
+    const host = GTTS_HOSTS[(attempt - 1) % GTTS_HOSTS.length];
+    try {
+      const audio = await requestGttsAudio(host, text, language);
+      fs.writeFileSync(destinationPath, audio);
+      return;
+    } catch (err) {
+      lastError = err;
+      const status = err instanceof GttsRequestError ? err.status : undefined;
+      const retryable = status === undefined || status === 408 || status === 429 || status >= 500;
+      if (!retryable || attempt >= GTTS_MAX_ATTEMPTS) break;
+      const wait = GTTS_RETRY_BACKOFF_MS * attempt;
+      logger.warn(
+        `Google TTS failed on ${host} (attempt ${attempt}/${GTTS_MAX_ATTEMPTS}); retrying in ${wait}ms: ${
+          err instanceof Error ? err.message : err
+        }`
+      );
+      if (wait > 0) await new Promise((resolve) => setTimeout(resolve, wait));
+    }
+  }
+  throw lastError instanceof Error ? lastError : new GttsRequestError('Google TTS failed.');
 }
 
 /**
- * Microsoft Edge "Read Aloud" neural voices — the free, keyless route to speech.
+ * Google Translate's own text-to-speech — the service the `gTTS` package wraps.
  *
- * Edge exposes the same neural voices as Azure Speech (e.g. km-KH Piseth/Sreymom,
- * en-US Guy/Aria, …) with no subscription and no quota, and there is a voice for
- * every target language the studio offers. It is Microsoft's public read-aloud
- * endpoint rather than a contracted API, so each line is retried and the pipeline
- * falls back to the original audio if the service is unreachable.
+ * It needs no key and no downloaded voice model: the text is sent to
+ * `translate_tts` and an MP3 comes back, which FFmpeg turns into the 44.1 kHz
+ * stereo WAV the mixing stage expects. One voice exists per language, so the
+ * `gender` setting cannot pick between a male and a female speaker here; the
+ * dialogue is spoken by the language's single gTTS voice.
  */
-export class EdgeTTSProvider implements TTSProvider {
-  name = 'edge';
+export class GoogleTTSProvider implements TTSProvider {
+  name = 'gtts';
 
   isConfigured(): boolean {
     // No key required — this is the always-available voice engine.
-    return process.env.EDGE_TTS_ENABLED !== 'false';
+    return process.env.GTTS_ENABLED !== 'false';
   }
 
   getModelName(): string {
-    // The default (Khmer) pair, which is what the settings card reports.
-    return `${edgeVoice(DEFAULT_TTS_LANGUAGE, 'female')} / ${edgeVoice(DEFAULT_TTS_LANGUAGE, 'male')}`;
-  }
-
-  private resolveVoice(
-    gender: 'male' | 'female' | 'neutral' | undefined,
-    language?: string
-  ): string {
-    return edgeVoice(language, gender === 'male' ? 'male' : 'female');
+    return GTTS_MODEL;
   }
 
   async synthesizeSpeech(
@@ -278,49 +243,50 @@ export class EdgeTTSProvider implements TTSProvider {
       throw new Error('Cannot synthesize empty speech text.');
     }
 
-    const voiceName = this.resolveVoice(options.gender, options.language);
-    const rawMp3Path = outputPath.replace(/\.wav$/, '_edge.mp3');
-    const rawWavPath = outputPath.replace(/\.wav$/, '_edge_raw.wav');
-    const synthDir = fs.mkdtempSync(path.join(os.tmpdir(), 'edge-tts-'));
-
-    try {
-      await withRetry(
-        async () => {
-          const tts = new MsEdgeTTS();
-          try {
-            await tts.setMetadata(voiceName, OUTPUT_FORMAT.AUDIO_24KHZ_48KBITRATE_MONO_MP3);
-            const result = await tts.toFile(synthDir, escapeSsml(cleanText));
-            if (!result.audioFilePath || !fs.existsSync(result.audioFilePath)) {
-              throw new Error('Edge TTS returned no audio file.');
-            }
-            fs.copyFileSync(result.audioFilePath, rawMp3Path);
-          } finally {
-            tts.close();
-          }
-        },
-        { operationName: `Edge TTS (${voiceName})`, maxAttempts: 3 }
-      );
-    } finally {
-      fs.rmSync(synthDir, { recursive: true, force: true });
+    const language = gttsLanguageCode(options.language);
+    const pieces = splitForGoogleTts(cleanText);
+    if (pieces.length === 0) {
+      throw new Error('Cannot synthesize empty speech text.');
     }
 
-    // Edge returns 24 kHz mono MP3; the mixing stage works in 44.1 kHz stereo WAV.
-    await FFmpegHelper.execute([
-      '-y',
-      '-i', rawMp3Path,
-      '-ar', '44100',
-      '-ac', '2',
-      rawWavPath,
-    ]);
+    const workDir = fs.mkdtempSync(path.join(os.tmpdir(), 'gtts-'));
 
-    // Used as produced: no tempo fit and no trim to the original slot (see the
-    // Gemini provider above for why).
-    fs.copyFileSync(rawWavPath, outputPath);
-
-    for (const tempPath of [rawMp3Path, rawWavPath]) {
-      if (fs.existsSync(tempPath)) {
-        try { fs.unlinkSync(tempPath); } catch {}
+    try {
+      const mp3Paths: string[] = [];
+      for (let i = 0; i < pieces.length; i++) {
+        const mp3Path = path.join(workDir, `part-${String(i + 1).padStart(3, '0')}.mp3`);
+        await fetchSpeech(pieces[i], language, mp3Path);
+        mp3Paths.push(mp3Path);
       }
+
+      if (mp3Paths.length === 1) {
+        // gTTS returns 24 kHz mono MP3; the mixing stage works in 44.1 kHz stereo.
+        await FFmpegHelper.execute([
+          '-y',
+          '-i', mp3Paths[0],
+          '-ar', '44100',
+          '-ac', '2',
+          outputPath,
+        ]);
+      } else {
+        // Several requests for one long line: join them in order, then transcode.
+        const listPath = path.join(workDir, 'parts.txt');
+        const list = mp3Paths
+          .map((file) => `file '${file.replace(/\\/g, '/').replace(/'/g, "'\\''")}'`)
+          .join('\n');
+        fs.writeFileSync(listPath, `${list}\n`, 'utf8');
+        await FFmpegHelper.execute([
+          '-y',
+          '-f', 'concat',
+          '-safe', '0',
+          '-i', listPath,
+          '-ar', '44100',
+          '-ac', '2',
+          outputPath,
+        ]);
+      }
+    } finally {
+      fs.rmSync(workDir, { recursive: true, force: true });
     }
 
     return {
@@ -330,50 +296,8 @@ export class EdgeTTSProvider implements TTSProvider {
   }
 }
 
-/**
- * Custom Khmer TTS Provider (e.g. ElevenLabs or dedicated Cambodian TTS API)
- */
-export class ExternalKhmerTTSProvider implements TTSProvider {
-  name = 'custom_khmer';
-
-  isConfigured(): boolean {
-    return Boolean(process.env.TTS_API_KEY && process.env.TTS_PROVIDER === 'custom_khmer');
-  }
-
-  getModelName(): string {
-    return process.env.TTS_MODEL || 'custom_khmer';
-  }
-
-  async synthesizeSpeech(
-    text: string,
-    outputPath: string,
-    options: TTSOptions
-  ): Promise<TTSResult> {
-    if (!this.isConfigured()) {
-      throw new Error('Custom Khmer TTS provider is selected but TTS_API_KEY is not set.');
-    }
-    // Fallback to Gemini if custom is configured as primary fallback
-    const geminiFallback = new GeminiTTSProvider();
-    return geminiFallback.synthesizeSpeech(text, outputPath, options);
-  }
-}
-
 export function getTTSProvider(): TTSProvider {
-  const provider = (process.env.TTS_PROVIDER || '').toLowerCase();
-
-  if (provider === 'custom_khmer') {
-    return new ExternalKhmerTTSProvider();
-  }
-  if (provider === 'gemini') {
-    return new GeminiTTSProvider();
-  }
-  if (provider === 'edge') {
-    return new EdgeTTSProvider();
-  }
-
-  // No explicit choice: use Gemini when a key is present, otherwise fall back to
-  // the keyless Edge voices so Khmer voice-over works out of the box.
-  const gemini = new GeminiTTSProvider();
-  if (gemini.isConfigured()) return gemini;
-  return new EdgeTTSProvider();
+  // gTTS is the voice engine, full stop: keyless, model-free, and able to speak
+  // every target the studio offers.
+  return new GoogleTTSProvider();
 }

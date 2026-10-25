@@ -8,13 +8,14 @@ interface TranslationSettingsProps {
   disabled?: boolean;
   /**
    * `<provider> · <model>` the server will translate with, e.g.
-   * "nllb · nllb-200-3.3B". Read from the config status; absent until
-   * the probe answers, so the line is simply not drawn while it is unknown.
+   * "googletrans · google-translate (googletrans)". Read from the config status;
+   * absent until the probe answers, so the line is simply not drawn while it is
+   * unknown.
    */
   engine?: string | null;
   /**
-   * The service that takes over when `engine` fails a block, when there is one.
-   * NLLB is the only translator, so this is normally absent.
+   * The service that takes over when `engine` fails a line, when there is one.
+   * Google Translate is the only translator, so this is normally absent.
    */
   engineFallback?: string | null;
 }

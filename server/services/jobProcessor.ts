@@ -12,8 +12,7 @@ import {
 } from './audioSeparation.js';
 import { getTranscriptionProvider } from './transcription.js';
 import { SpeakerDetector } from './speakerDetection.js';
-import { getTranslationService } from './translation.js';
-import { subtitleLanguageTag } from './nllbProvider.js';
+import { getTranslationService, subtitleLanguageTag } from './translation.js';
 import { getTTSProvider } from './tts.js';
 import { AudioMixingService } from './audioMixing.js';
 import { VideoRenderingService } from './videoRendering.js';
@@ -45,8 +44,8 @@ export const KHMER_STEP_MESSAGES: Record<JobStatus, string> = {
   separating_audio: 'កំពុងបំបែកសំឡេងមនុស្សចេញដោយ Demucs...',
   transcribing: 'កំពុងបម្លែងសំឡេងទៅជាអក្សរដោយ Whisper...',
   detecting_speakers: 'កំពុងកំណត់អត្តសញ្ញាណអ្នកនិយាយ...',
-  translating: 'កំពុងបកប្រែអត្ថបទទៅភាសាគោលដៅ (NLLB-200)...',
-  generating_voice: 'កំពុងបង្កើតសំឡេងពីអក្សរ (Khmer TTS)...',
+  translating: 'កំពុងបកប្រែអត្ថបទទៅភាសាគោលដៅ (Google Translate)...',
+  generating_voice: 'កំពុងបង្កើតសំឡេងពីអក្សរ (gTTS)...',
   mixing: 'កំពុងដាក់សំឡេងខ្មែរចូលវីដេអូ ជាមួយភ្លេងផ្ទៃខាងក្រោយ...',
   rendering: 'កំពុងដាក់សំឡេងខ្មែរចូលវីដេអូ — Render MP4 ចុងក្រោយ (H.264/AAC)...',
   quality_check: 'កំពុងត្រួតពិនិត្យវីដេអូចុងក្រោយ...',
@@ -61,8 +60,8 @@ export const ENGLISH_STEP_MESSAGES: Record<JobStatus, string> = {
   separating_audio: 'Demucs: separating human voices from the music...',
   transcribing: 'Whisper: converting speech to text...',
   detecting_speakers: 'Identifying speakers and vocal characteristics...',
-  translating: 'NLLB-200: translating the dialogue to Khmer...',
-  generating_voice: 'Khmer TTS: generating Khmer voice from the Khmer text...',
+  translating: 'Google Translate: translating the dialogue...',
+  generating_voice: 'gTTS: generating the dubbed voice from the translated text...',
   mixing: 'Writing the Khmer voice back into the video, under the music...',
   rendering: 'Writing the Khmer voice back into the video: final H.264/AAC MP4...',
   quality_check: 'Checking the finished video...',
@@ -73,8 +72,8 @@ export const ENGLISH_STEP_MESSAGES: Record<JobStatus, string> = {
 /**
  * Progress percentage mapping, spread across the four stages the studio shows:
  *
- *   Upload → Demucs → Speech-to-Text → NLLB-200
- *   (then the closing steps: subtitles + Khmer voice, and the final render)
+ *   Upload → Demucs → Speech-to-Text → Google Translate
+ *   (then the closing steps: subtitles + gTTS voice, and the final render)
  *
  * `detecting_speakers` is no longer reported — speaker naming happens inside the
  * Whisper pass — but it stays in the map because jobs recorded before that change
@@ -368,9 +367,9 @@ export class JobProcessor {
       if (ttsAvailable) {
         // Lines are independent, so synthesize several at once instead of the
         // old one-at-a-time loop; a 60-line video used to spend a full minute here.
-        // Edge is a keyless public endpoint that serves many parallel lines, so it
-        // runs wide: it is the only voice engine the site uses.
-        const defaultTtsConcurrency = ttsProvider.name === 'edge' ? 6 : 3;
+        // gTTS is a keyless public endpoint that throttles by IP, so it runs a few
+        // lines wide rather than as many as possible.
+        const defaultTtsConcurrency = 3;
         const ttsConcurrency = Math.max(
           1,
           Number(process.env.TTS_CONCURRENCY) || defaultTtsConcurrency
@@ -656,11 +655,10 @@ export class JobProcessor {
           'អត្រាប្រើប្រាស់ AI ពេញ (rate limit)។ សូមរង់ចាំបន្តិច រួចសាកល្បងម្តងទៀត។ (AI rate limit reached: wait a moment and try again.)';
       } else if (
         errMsg.includes('is not configured') ||
-        errMsg.includes('No translation provider') ||
-        errMsg.includes('ភ្ជាប់ NLLB')
+        errMsg.includes('Google Translate')
       ) {
         friendlyKhmer =
-          'មិនទាន់ភ្ជាប់ NLLB API ទេ។ សូមបើក NLLB លើ Google Colab រួច paste URL ក្នុងកាត «បកប្រែ · NLLB API»។ (No NLLB translation service is connected — open the NLLB panel and paste the Colab URL.)';
+          'ការបកប្រែដោយ Google Translate មិនអាចដំណើរការបានទេ។ សូមពិនិត្យការតភ្ជាប់អ៊ីនធឺណិតរបស់ម៉ាស៊ីនបម្រើ រួចសាកល្បងម្តងទៀត។ (Google Translate could not be reached from the server — check its network and try again.)';
       } else if (/\(401\)|invalid api key/i.test(errMsg)) {
         friendlyKhmer =
           'API key មិនត្រឹមត្រូវ ឬត្រូវបានលុបចោល។ សូមពិនិត្យ GROQ_API_KEY ម្តងទៀត។ (Invalid or revoked API key.)';

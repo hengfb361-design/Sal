@@ -1,14 +1,6 @@
-import { DialogueSegment, JobSettings } from '../types.js';
+import { DialogueSegment, JobSettings, TargetLanguage } from '../types.js';
 import { logger } from '../utils/logger.js';
-import {
-  NLLB_TARGET_LANGUAGE,
-  NLLB_TRANSLATION_MODEL,
-  floresCodeFor,
-  floresCodeForTarget,
-  isNllbConfigured,
-  translateWithConfiguredNllb,
-} from './nllbProvider.js';
-import { mapWithConcurrency } from '../utils/concurrency.js';
+import { googleTargetCode, translateLines } from './googleTranslate.js';
 
 export interface TranslationResult {
   segments: DialogueSegment[];
@@ -17,7 +9,7 @@ export interface TranslationResult {
 
 export interface TranslationOutcome {
   segments: DialogueSegment[];
-  /** Non-fatal problems (e.g. one block kept the original text) for the job warning. */
+  /** Non-fatal problems (e.g. one line kept the original text) for the job warning. */
   warnings: string[];
 }
 
@@ -26,25 +18,16 @@ export type TranslationProgressCallback = (
   totalLines: number
 ) => void | Promise<void>;
 
-/** NLLB is the only translator, so it is the only provider name there is. */
-export type TranslationProviderName = 'nllb';
-
 /**
- * How many dialogue lines go into one NLLB request.
- *
- * The Colab service is asked for one batch at a time, so a shorter block keeps
- * progress reporting honest without queueing a long tail; wider blocks amortise
- * the round trip over more lines. `TRANSLATION_CHUNK_SIZE` overrides this.
+ * Translation runs on Google Translate, reached over HTTPS with no key and no
+ * model download — the same service the Python `googletrans` package uses. It is
+ * the only translator the pipeline has, so there is never a fallback provider to
+ * name.
  */
-const DEFAULT_CHUNK_SIZE = 32;
+export type TranslationProviderName = 'googletrans';
 
-/**
- * How many transcript blocks are translated at the same time. Blocks are
- * separate `/translate` requests with no dependency between them, so asking a
- * couple at once keeps the Colab model fed. `TRANSLATION_CONCURRENCY` overrides
- * this.
- */
-const DEFAULT_CONCURRENCY = 4;
+/** What the settings panel calls the engine. */
+export const GOOGLE_TRANSLATE_MODEL = 'google-translate (googletrans)';
 
 /**
  * Khmer is U+1780-U+17FF. Thai (U+0E00-U+0E7F) and Lao (U+0E80-U+0EFF) look close
@@ -145,32 +128,45 @@ export function mergeDialogueFragments(
 }
 
 /**
- * The translation stage runs on **NLLB-200 and nothing else**.
+ * ISO 639-3 tags for the MP4's caption track (`khm`, `eng`, `zho`, …).
  *
- * The owner asked for Groq and Gemini to be taken out of translation and for
- * NLLB-200 to do the translating, served from Google Colab (every NLLB-200 needs
- * more RAM than the free Render instance has). The Colab service runs the
- * strongest preset by default (`facebook/nllb-200-3.3B`, `NLLB_MODE=best`) and
- * steps down that table when a runtime cannot hold it. So the
- * provider is no longer a choice: every block goes to the NLLB service, and
- * `TRANSLATION_PROVIDER` / `GEMINI_*` / `GROQ_TRANSLATION_*` no longer pick a
- * translator. Groq is still used for speech-to-text, which the owner kept.
+ * The muxer wants that three-letter code, and it is what makes the player's CC
+ * badge name the right language instead of "und".
+ */
+const SUBTITLE_LANGUAGE_TAGS: Record<TargetLanguage, string> = {
+  km: 'khm',
+  en: 'eng',
+  zh: 'zho',
+  th: 'tha',
+  vi: 'vie',
+  ko: 'kor',
+  ja: 'jpn',
+  fr: 'fra',
+  es: 'spa',
+};
+
+/** The caption tag for the studio's chosen target; Khmer is the default. */
+export function subtitleLanguageTag(targetLanguage: string | undefined): string {
+  const key = (targetLanguage || '').trim().toLowerCase() as TargetLanguage;
+  return SUBTITLE_LANGUAGE_TAGS[key] || SUBTITLE_LANGUAGE_TAGS.km;
+}
+
+/**
+ * Google Translate is the translator, so the stage is always ready: there is no
+ * service URL or key left for the owner to connect.
  */
 export function resolveTranslationProvider(): TranslationProviderName {
-  return 'nllb';
+  return 'googletrans';
 }
 
 export class KhmerDubTranslationService {
   private modelName: string;
   private provider: TranslationProviderName;
-  /** Providers that actually answered a block; reported by the job's log line. */
-  private answeredProviders = new Set<TranslationProviderName>();
 
   constructor() {
     this.provider = resolveTranslationProvider();
-    // NLLB is served over HTTP, so the model name is the Colab service's model
-    // rather than anything this process loads.
-    this.modelName = NLLB_TRANSLATION_MODEL;
+    // No model is loaded anywhere: the label names the service, not a checkpoint.
+    this.modelName = GOOGLE_TRANSLATE_MODEL;
   }
 
   public getProviderName(): TranslationProviderName {
@@ -181,53 +177,41 @@ export class KhmerDubTranslationService {
     return this.modelName;
   }
 
+  /** Keyless and model-free, so nothing has to be configured first. */
   public isConfigured(): boolean {
-    return isNllbConfigured();
+    return process.env.GOOGLE_TRANSLATE_ENABLED !== 'false';
   }
 
-  /** NLLB has no model rotation behind it, so there is never a fallback model. */
+  /**
+   * How many lines are translated at the same time.
+   *
+   * The free endpoint answers one line per request, so a few in flight keeps the
+   * stage as fast as the service allows without tripping its per-IP throttling.
+   * `GOOGLE_TRANSLATE_CONCURRENCY` overrides it.
+   */
+  public getConcurrency(): number {
+    const configured = Number(process.env.GOOGLE_TRANSLATE_CONCURRENCY);
+    return Number.isFinite(configured) && configured >= 1 ? Math.floor(configured) : 6;
+  }
+
+  /** There is no model rotation behind Google Translate, so never a fallback model. */
   public getFallbackModelNames(): string[] {
     return [];
   }
 
-  /** NLLB is the only translator, so no service takes over when a block fails. */
+  /** Google Translate is the only translator, so nothing takes over when it fails. */
   public getFallbackProviderName(): TranslationProviderName | null {
     return null;
-  }
-
-  /** How many dialogue lines go into a single NLLB request. */
-  public getChunkSize(): number {
-    const configured = Number(process.env.TRANSLATION_CHUNK_SIZE);
-    return Number.isFinite(configured) && configured >= 1
-      ? Math.floor(configured)
-      : DEFAULT_CHUNK_SIZE;
-  }
-
-  /**
-   * How many blocks are in flight at once.
-   *
-   * The NLLB service translates one batch at a time, so a couple of blocks in
-   * flight keeps it fed without queueing a long tail; `TRANSLATION_CONCURRENCY`
-   * overrides it.
-   */
-  public getConcurrency(): number {
-    const configured = Number(process.env.TRANSLATION_CONCURRENCY);
-    return Number.isFinite(configured) && configured >= 1
-      ? Math.floor(configured)
-      : DEFAULT_CONCURRENCY;
   }
 
   /**
    * Translates dialogue segments into the studio's chosen target language —
    * Khmer by default, or whichever language the picker names.
    *
-   * The transcript is sent to the NLLB service in blocks rather than one giant
-   * request: a block is one `/translate` call, so the job can report real
-   * progress and a bad block cannot discard the whole transcript.
-   *
-   * The blocks do not depend on each other, so they are asked at the same time
-   * (see getConcurrency) and the stage costs roughly one round trip per wave
-   * instead of one per block.
+   * Every line is its own Google Translate request (that is how the free endpoint
+   * works), sent a few at a time. A line the service could not answer keeps the
+   * original text and is reported in the job warning, so one throttled request
+   * cannot discard a whole transcript.
    */
   public async translateDialogue(
     segments: DialogueSegment[],
@@ -236,7 +220,7 @@ export class KhmerDubTranslationService {
   ): Promise<TranslationOutcome> {
     if (!this.isConfigured()) {
       throw new Error(
-        'មិនទាន់ភ្ជាប់ NLLB API ទេ។ (No NLLB translation service is connected — open the NLLB panel and paste the Colab URL.)'
+        'Google Translate ត្រូវបានបិទនៅក្នុងការកំណត់របស់ម៉ាស៊ីនបម្រើ។ (Google Translate is disabled on this server: GOOGLE_TRANSLATE_ENABLED=false.)'
       );
     }
 
@@ -246,7 +230,7 @@ export class KhmerDubTranslationService {
 
     // Whisper's windows are cut where its silence detector fired, which regularly
     // lands mid-sentence. Welding those fragments back together before anything
-    // is translated is what lets the model read a whole thought — and keeps the
+    // is translated is what lets the service read a whole thought — and keeps the
     // dub saying what the actor said instead of two halves of it.
     const ordered = mergeDialogueFragments(segments);
     const mergedCount = segments.length - ordered.length;
@@ -256,53 +240,22 @@ export class KhmerDubTranslationService {
       );
     }
 
-    const chunkSize = this.getChunkSize();
-    const chunks: DialogueSegment[][] = [];
-    for (let i = 0; i < ordered.length; i += chunkSize) {
-      chunks.push(ordered.slice(i, i + chunkSize));
-    }
-
-    this.answeredProviders.clear();
-
-    const translations = new Map<string, { khmer: string; emotion?: string }>();
     const warnings: string[] = [];
-    // Blocks run at the same time, so the same problem (or the same failure) can be
-    // reported by more than one of them; each reason is listed once.
-    const warningSet = new Set<string>();
-    const addWarning = (message: string) => {
-      if (warningSet.has(message)) return;
-      warningSet.add(message);
-      warnings.push(message);
-    };
-
-    const tgtLang = floresCodeForTarget(settings.targetLanguage);
-    const targetIsKhmer = tgtLang === NLLB_TARGET_LANGUAGE;
-
-    const concurrency = Math.max(1, Math.min(this.getConcurrency(), chunks.length));
+    const targetIsKhmer = googleTargetCode(settings.targetLanguage) === 'km';
     const startedAt = Date.now();
-    let completedLines = 0;
 
-    await mapWithConcurrency(chunks, concurrency, async (chunk, i) => {
-      // NLLB takes one plain list of lines and answers one line per line; it
-      // follows no instructions, so the block goes straight to the Colab service
-      // and the deterministic passes (script sanitising, the final mapping) do the
-      // rest. No prompt building, no rescue/glossary/proper-name retries.
-      await this.translateChunkWithNllb(
-        chunk,
-        settings,
-        tgtLang,
-        translations,
-        addWarning,
-        i,
-        chunks.length
-      );
-      completedLines += chunk.length;
-      if (onProgress) await onProgress(completedLines, ordered.length);
-    });
+    const translations = await translateLines(
+      ordered.map((segment) => ({ id: segment.id, text: segment.text })),
+      {
+        sourceLanguage: settings.sourceLanguage,
+        targetLanguage: settings.targetLanguage,
+        concurrency: this.getConcurrency(),
+        onLineDone: onProgress ? (completed, total) => onProgress(completed, total) : undefined,
+      }
+    );
 
     const translatedSegments = ordered.map((segment) => {
-      const item = translations.get(segment.id);
-      const line = (item?.khmer || '').trim();
+      const line = (translations.get(segment.id) || '').trim();
 
       // Any target but Khmer: the service's answer is the dub line as-is. Thai,
       // Lao, Latin or Han output is the point here, so nothing is stripped and
@@ -312,7 +265,7 @@ export class KhmerDubTranslationService {
         return {
           ...segment,
           khmer: line || segment.text,
-          emotion: item?.emotion || 'neutral',
+          emotion: segment.emotion || 'neutral',
         };
       }
 
@@ -320,11 +273,7 @@ export class KhmerDubTranslationService {
       // Definitive output sanitization: never ship Thai/Lao.
       if (khmer && hasWrongScript(khmer)) {
         const cleaned = sanitizeKhmer(khmer);
-        if (cleaned) {
-          khmer = cleaned;
-        } else {
-          khmer = '';
-        }
+        khmer = cleaned || '';
       }
       // A valid Khmer line must contain Khmer script. If the source itself is
       // already Khmer (e.g. sourceLanguage=km), keeping it is correct.
@@ -337,7 +286,7 @@ export class KhmerDubTranslationService {
       return {
         ...segment,
         khmer: finalSanitized,
-        emotion: item?.emotion || 'neutral',
+        emotion: segment.emotion || 'neutral',
       };
     });
 
@@ -351,79 +300,23 @@ export class KhmerDubTranslationService {
       logger.error(`Post-translation audit: ${auditBad} line(s) still have Thai/Lao script after sanitization!`);
     }
 
-    const answeredBy =
-      this.answeredProviders.size > 0
-        ? [...this.answeredProviders].join(' + ')
-        : `${this.provider} (no block answered)`;
+    const missing = ordered.length - translations.size;
+    if (missing > 0) {
+      warnings.push(
+        `បន្ទាត់ចំនួន ${missing}/${ordered.length} មិនអាចបកប្រែដោយ Google Translate បានទេ ដូច្នេះវារក្សាអក្សរដើម។ (${missing} of ${ordered.length} line(s) could not be translated by Google Translate; they keep the original text.)`
+      );
+    }
 
     logger.info(
-      `Translated ${translations.size}/${ordered.length} dialogue lines into ${tgtLang} via ${answeredBy} in ${
-        chunks.length
-      } block(s), ${concurrency} at a time, ${((Date.now() - startedAt) / 1000).toFixed(1)}s.`
+      `Translated ${translations.size}/${ordered.length} dialogue lines into ${googleTargetCode(
+        settings.targetLanguage
+      )} with Google Translate, ${this.getConcurrency()} at a time, ${(
+        (Date.now() - startedAt) /
+        1000
+      ).toFixed(1)}s.`
     );
 
     return { segments: translatedSegments, warnings };
-  }
-
-  /**
-   * Translate one block with the NLLB service.
-   *
-   * The only thing the service needs is the list of lines and the source FLORES
-   * code; the answer is one Khmer line per id. A line the service skipped is left
-   * out of the map, which the caller reports and the final mapping falls back to
-   * the source for.
-   */
-  private async translateChunkWithNllb(
-    chunk: DialogueSegment[],
-    settings: JobSettings,
-    tgtLang: string,
-    translations: Map<string, { khmer: string; emotion?: string }>,
-    addWarning: (message: string) => void,
-    blockIndex: number,
-    blockCount: number
-  ): Promise<void> {
-    const srcLang = floresCodeFor(settings.sourceLanguage);
-
-    try {
-      const answers = await translateWithConfiguredNllb(
-        chunk.map((segment) => ({ id: segment.id, text: segment.text })),
-        srcLang,
-        tgtLang
-      );
-      this.answeredProviders.add('nllb');
-
-      let missing = 0;
-      for (const segment of chunk) {
-        const khmer = (answers.get(segment.id) || '').trim();
-        if (!khmer) {
-          missing++;
-          continue;
-        }
-        // NLLB reports no emotion; the final mapping defaults it to 'neutral'.
-        translations.set(segment.id, { khmer });
-      }
-
-      logger.info(
-        `NLLB block ${blockIndex + 1}/${blockCount}: translated ${
-          chunk.length - missing
-        }/${chunk.length} line(s) (${srcLang} -> ${tgtLang}).`
-      );
-
-      if (missing > 0) {
-        addWarning(
-          `បន្ទាត់ចំនួន ${missing} ក្នុងក្រុមទី ${blockIndex + 1} មិនបានបកប្រែទេ ដូច្នេះវារក្សាអក្សរដើម។ (${missing} line(s) in block ${
-            blockIndex + 1
-          } of ${blockCount} came back untranslated; the original text was kept for them.)`
-        );
-      }
-    } catch (err: any) {
-      logger.warn(`NLLB block ${blockIndex + 1}/${blockCount} failed:`, err);
-      addWarning(
-        `ក្រុមបកប្រែទី ${blockIndex + 1}/${blockCount} បរាជ័យ ដូច្នេះបន្ទាត់ក្នុងក្រុមនោះរក្សាអក្សរដើម។ (NLLB translation block ${
-          blockIndex + 1
-        }/${blockCount} failed: ${err?.message ?? 'unknown error'})`
-      );
-    }
   }
 
   /** Convenience wrapper for callers that only need the translated lines. */

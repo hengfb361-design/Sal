@@ -1153,13 +1153,11 @@ export async function describeRemoteService(
 }
 
 /**
- * True when the service that answered is clearly the NLLB translation API, not
- * Demucs.
+ * True when the service that answered is clearly a translation API, not Demucs.
  *
  * Both answer `{ status: 'ok' }`, so a plain reachability probe would happily
- * accept the translation tunnel pasted into this card — and then a real job
- * would 404 on every stem request. The service's own name is what tells them
- * apart.
+ * accept a translation URL pasted into this card — and then a real job would 404
+ * on every stem request. The service's own name is what tells them apart.
  */
 export function looksLikeTranslationService(service: string | null): boolean {
   const text = (service || '').toLowerCase();

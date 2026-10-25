@@ -18,8 +18,8 @@ interface StepItem {
 /**
  * The pipeline the studio actually runs, in order:
  *
- *   Upload Video → Demucs API → Speech-to-Text → NLLB-200
- *   (then: subtitles + Khmer voice, and the final FFmpeg mix/render)
+ *   Upload Video → Demucs API → Speech-to-Text → Google Translate
+ *   (then: gTTS voice + subtitle track, and the final FFmpeg sync/mix/render)
  *
  * Four rows, one per stage the owner wants on screen: the Khmer line names what
  * the stage does, the line under it names the engine that does it. Each row owns
@@ -32,11 +32,11 @@ interface StepItem {
  * when the job is inside one of them every row above is already finished, and
  * the overall progress bar is where that remaining work is visible.
  *
- * The dialogue is translated by NLLB-200 (`facebook/nllb-200-3.3B`, the
- * strongest preset the Colab service runs by default), served from the owner's
- * Google Colab session, so row 4 names it. The speech-to-text step
- * runs on Groq Whisper, and the subtitle files and the Khmer voice are produced
- * on the server itself — no language model is asked to do either of them.
+ * The dialogue is translated by Google Translate (the keyless public endpoint the
+ * `googletrans` package uses — no model is downloaded), so row 4 names it. The
+ * speech-to-text step runs on Groq Whisper, and the dub is spoken by gTTS (Google
+ * Translate's own text-to-speech); FFmpeg then places every line on its timestamp
+ * and muxes the result back into the video on the server itself.
  */
 const PIPELINE_STAGES: StepItem[] = [
   {
@@ -54,13 +54,13 @@ const PIPELINE_STAGES: StepItem[] = [
   {
     id: 'transcribing',
     khmer: 'បម្លែងសំឡេងនិយាយទៅជាអត្ថបទ',
-    english: 'Demucs Speech-to-Text',
+    english: 'Speech-to-Text (ASR)',
     associatedStatuses: ['transcribing', 'detecting_speakers'],
   },
   {
     id: 'translating',
     khmer: 'បកប្រែអត្ថបទទៅភាសាគោលដៅ',
-    english: 'NLLB-200',
+    english: 'Google Translate',
     associatedStatuses: ['translating'],
   },
 ];
@@ -86,7 +86,7 @@ const LATE_STATUSES: JobStatus[] = [
  * said under the list so it travels with what it describes.
  */
 const ENGINE_NOTE =
-  'ការបកប្រែប្រើ NLLB-200 (mode ខ្លាំងជាងគេ — facebook/nllb-200-3.3B) ដែលរត់នៅលើ Google Colab របស់អ្នក។ ការស្តាប់ចាប់អក្សរប្រើ Groq Whisper ហើយអក្សររត់ (Subtitle) និងសំឡេងបកប្រែ បង្កើតនៅលើម៉ាស៊ីនបម្រើផ្ទាល់។ (Translation runs on NLLB-200 (strongest preset — facebook/nllb-200-3.3B) served from your Google Colab session. Speech-to-text runs on Groq Whisper; subtitles and the Khmer voice are produced on the server itself.)';
+  'ការញែកសំឡេងប្រើ Demucs ការស្តាប់ចាប់អក្សរប្រើ ASR (Groq Whisper) ការបកប្រែប្រើ Google Translate (googletrans — គ្មានការ download ម៉ូដែល) សំឡេងបកប្រែបង្កើតដោយ gTTS ហើយ FFmpeg តម្រឹមសំឡេងជាមួយវីដេអូ និងបញ្ចូលជាឯកសារចុងក្រោយ។ (Voices are split by Demucs, speech is transcribed by ASR (Groq Whisper), translated by Google Translate (googletrans — no model download), spoken by gTTS, then FFmpeg syncs and muxes the final file.)';
 
 export const ProcessingProgress: React.FC<ProcessingProgressProps> = ({ job, onRetry }) => {
   const currentStatus = job.status;

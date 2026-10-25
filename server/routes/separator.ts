@@ -204,7 +204,7 @@ router.post('/test', async (req: Request, res: Response) => {
         service,
         latencyMs,
         detail:
-          'URL នេះជា NLLB API មិនមែន Demucs ទេ។ សូមដាក់ URL របស់ Demucs API វិញ។ (This URL is the NLLB translation API, not the stem/Demucs service — paste the Demucs URL instead.)',
+          'URL នេះជាសេវាបកប្រែ មិនមែន Demucs ទេ។ សូមដាក់ URL របស់ Demucs API វិញ។ (This URL is a translation API, not the stem/Demucs service — paste the Demucs URL instead.)',
         url: connection.url,
       });
     }
@@ -250,7 +250,7 @@ router.post('/test', async (req: Request, res: Response) => {
         service,
         latencyMs: 0,
         detail:
-          'URL នេះជា NLLB API មិនមែន Demucs ទេ។ សូមដាក់ URL របស់ Demucs API វិញ។ (This URL is the NLLB translation API, not the stem/Demucs service — paste the Demucs URL instead.)',
+          'URL នេះជាសេវាបកប្រែ មិនមែន Demucs ទេ។ សូមដាក់ URL របស់ Demucs API វិញ។ (This URL is a translation API, not the stem/Demucs service — paste the Demucs URL instead.)',
         url: connection.url,
       });
     }

@@ -12,34 +12,37 @@ short_description: AI video translation with natural Khmer dubbing
 # KhmerDub AI
 
 AI video translation and natural dubbing. Upload a video, and the pipeline
-transcribes the speech, translates it into the language you choose (**Khmer** by
-default, or English/Chinese/Thai/Vietnamese/Korean/Japanese/French/Spanish),
-generates speech in that language, keeps the original music/background, and
-renders a new MP4 with subtitles.
+splits the voices out of the music, transcribes the speech, translates it into
+the language you choose (**Khmer** by default, or
+English/Chinese/Thai/Vietnamese/Korean/Japanese/French/Spanish), speaks the
+translation with gTTS, keeps the original music/background, and muxes a new MP4
+with subtitles.
 
 This Space runs the **whole app** (frontend + API) from one container.
 
 ## Pipeline
 
-Four steps, in the order the studio shows them:
+Six engines, in the order they run:
 
 | Step | Engine |
 | --- | --- |
 | 1. Upload Video | upload + FFmpeg audio extraction |
-| 2. Demucs API | Demucs (remote stem API) — ញែកសំឡេងនិយាយ និងតន្ត្រី |
-| 3. Demucs Speech-to-Text | Whisper via Groq `whisper-large-v3` |
-| 4. NLLB-200 | Strongest mode by default — `facebook/nllb-200-3.3B` (`NLLB_MODE=best`) served from Google Colab (`tools/nllb-colab/`) — the only translator, and it translates into the **target language** the studio picked (Khmer by default). Gemini and Groq are no longer used for translation. Transcript fragments Whisper split mid-sentence are rejoined before translation, and a **Khmer** target is sanitised (no Thai/Lao); any other target keeps its own script untouched |
+| 2. Demucs | Demucs (remote stem API) — ញែកសំឡេងនិយាយចេញពីតន្ត្រី/ផ្ទៃខាងក្រោយ |
+| 3. ASR | Whisper via Groq `whisper-large-v3` — បំលែងសំឡេងទៅជាអក្សរ |
+| 4. Google Translate | the free `translate_a/single` endpoint — the same one the Python `googletrans` package uses. **No API key and no model download**: each line is one HTTPS request, translated into the **target language** the studio picked (Khmer by default). Transcript fragments Whisper split mid-sentence are rejoined first, and a **Khmer** target is sanitised (no Thai/Lao); any other target keeps its own script untouched |
+| 5. gTTS | Google Translate's own `translate_tts` endpoint — what the `gTTS` package wraps. Keyless, no voice model, one MP3 per request (a long line is cut at punctuation into ≤180-character pieces and joined back into one WAV) |
+| 6. Sync + FFmpeg | every line is placed on the timestamp where it was spoken (`adelay`), mixed under the kept music/background, and muxed back into the video as the final MP4 |
 
-The run does not stop at the fourth row. The dubbed voice and the subtitle files
-are produced next, and FFmpeg mixes and renders the final MP4 — but those closing
-steps have no rows of their own, so the checklist on screen shows the four stages
-above and the overall progress bar carries the rest of the job.
+The studio's checklist shows the first four rows — upload, Demucs, ASR and
+translate. The voice, the subtitle track and the final render run after them and
+the overall progress bar carries that work.
 
-Nothing is lost by not naming them. The voice is already in time when the mixer
-starts, and that costs nothing extra:
+Nothing is lost by not naming those closing steps. The voice is already in time
+when the mixer starts, and that costs nothing extra:
 
 - The assembler places every line at its own timestamp (`adelay`) and pads the
-  track to the video's length (`apad=whole_dur`).
+  track to the video's length (`apad=whole_dur`), so a line starts where it was
+  spoken even though the translated sentence is longer than the original one.
 - The render caps the result at the video's own length (`-t meta.duration`), so the
   file can never end a frame early or leave the last frames in silence.
 - The mixer balances the dubbed voice against the background music. When the
@@ -72,8 +75,8 @@ Set `AUDIO_SEPARATOR_URL` to wherever Demucs runs:
 | Home server / VPS | `tools/demucs-termux/run-local.sh` |
 | Bundled sidecar | `tools/audio-separator-server/` |
 
-Translation has the same shape: `tools/nllb-colab/` runs NLLB-200 on Colab and
-its URL/key are set in the «បកប្រែ · NLLB API» panel.
+Translation and voice need no service to connect: both are the public Google
+endpoints described above, reached from the server's own HTTPS request.
 
 Colab is the fast option: the same `demucs_api.py` runs on a free GPU, so the API
 answers with `"device":"cuda"` and the pipeline then sends it far bigger pieces
@@ -91,12 +94,12 @@ job without the setting behaves exactly as it did before the picker existed; pic
 another language and both the dub and the caption track follow it. The whole
 pipeline is target-aware:
 
-- translation asks NLLB for the chosen target (`tgt_lang`);
-- the Edge voice engine speaks it (km-KH Sreymom/Piseth, en-US Aria/Guy, th-TH
-  Premwadee/Niwat, vi-VN HoaiMy/NamMinh, zh-CN Xiaoxiao/Yunxi, ko-KR SunHi/InJoon,
-  ja-JP Nanami/Keita, fr-FR Denise/Henri, es-ES Elvira/Alvaro). A per-language
-  override is `EDGE_TTS_VOICE_FEMALE_<CODE>` / `EDGE_TTS_VOICE_MALE_<CODE>`; the
-  older `EDGE_TTS_VOICE_FEMALE` / `EDGE_TTS_VOICE_MALE` still override Khmer.
+- translation asks Google Translate for the chosen target code (`zh` is sent as
+  `zh-CN`, every other language keeps its own two-letter code);
+- gTTS speaks it (`km`, `en`, `zh-CN`, `th`, `vi`, `ko`, `ja`, `fr`, `es`). The
+  free endpoint has one voice per language, so the studio's male/female choice
+  cannot change the speaker here — every line is spoken by that language's gTTS
+  voice.
 - the MP4's caption track is tagged with the target's ISO 639-3 code, so the
   player's CC badge names the right language.
 
@@ -151,12 +154,16 @@ Add these in **Settings → Variables and secrets** as **Secrets** (not variable
 | --- | --- | --- |
 | `GROQ_API_KEY` | yes | [console.groq.com/keys](https://console.groq.com/keys) — speech-to-text only |
 | `GROQ_API_KEY2`, `GROQ_API_KEY3` | optional | Extra keys; the app rotates to them automatically on 401/429 |
-| `NLLB_TRANSLATION_URL` | yes | Base URL of the NLLB service (`tools/nllb-colab/`); the «បកប្រែ · NLLB API» panel overrides it |
-| `NLLB_TRANSLATION_API_KEY` | optional | Bearer token of that service |
 | `STT_PROVIDER` | optional | `groq` (default) |
 | `AUDIO_SEPARATOR_URL` | yes | Base URL of the Demucs stem service |
 | `AUDIO_SEPARATOR_API_KEY` | optional | Bearer token, when the service has one |
 | `FFMPEG_RENDER_ARGS` | optional | x264 settings for the release MP4 (default `-preset veryfast -crf 21`) |
+| `GOOGLE_TRANSLATE_CONCURRENCY` | optional | Lines translated at once (default 6) |
+| `TTS_CONCURRENCY` | optional | Lines voiced at once (default 3) |
+
+Translation and voice need **no key**: Google Translate and gTTS are called
+keylessly. `GOOGLE_TRANSLATE_ENABLED=false` / `GTTS_ENABLED=false` are the only
+switches, and they exist so a deployment can take those stages out on purpose.
 
 The release encode is the slowest step on a free host, which has a fraction of
 one CPU, so its settings are chosen for that: the measurements behind
@@ -182,20 +189,14 @@ Cloudflare R2 / S3 bucket to persist them:
   Spaces need a PRO subscription. Deploy this folder elsewhere for free — see
   `render.yaml` for a Render free web service — or self-host it.
 - Free instances sleep after a period of inactivity and wake on the next visit.
-- Translation runs on **NLLB-200** served from a Google Colab session
-  (`tools/nllb-colab/`), because every NLLB-200 needs more RAM than the free
-  Render instance has (512 MB). The Colab service picks its model from a quality
-  preset — `NLLB_MODE=best` (default) is `facebook/nllb-200-3.3B`, the strongest
-  NLLB-200; `balanced` is `facebook/nllb-200-distilled-1.3B` and `fast` is
-  `facebook/nllb-200-distilled-600M`. It loads in fp16 on a GPU and generates in
-  chunks (`NLLB_BATCH_SIZE`), and if a runtime cannot hold the chosen model — out
-  of memory, or a CPU-only runtime — it steps down the preset table instead of
-  timing out. `GET /` reports the model and mode in use (and `fallback: true`
-  when it had to step down), which the studio's test button shows. The Colab
-  URL/key are pasted into the «បកប្រែ · NLLB API» panel in the studio (or set with
-  `NLLB_TRANSLATION_URL` / `NLLB_TRANSLATION_API_KEY`). The target language is sent
-  per request (`tgt_lang`), so one Colab service serves every target. Termux/Demucs
-  and Groq Whisper speech-to-text are unchanged.
+- Translation and voice run on Google's public endpoints, so there is no Colab
+  session to keep alive: the translate stage is always ready. Those endpoints are
+  keyless but shared by IP, so a throttled request (429) is retried on a second
+  host with a short backoff and, if it still fails, that one line keeps the
+  original text and says so in the job warning. `GOOGLE_TRANSLATE_CONCURRENCY` and
+  `TTS_CONCURRENCY` lower the parallel requests if a host is being throttled.
+- Demucs is still the one service you must run somewhere (see above) and
+  `GROQ_API_KEY` is still required for the ASR step.
 - Video processing is CPU-bound: a ~1 minute video takes roughly 1–3 minutes.
 
 ## Local / self-hosted run

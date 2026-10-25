@@ -31,7 +31,7 @@ router.get('/status', async (req: Request, res: Response) => {
   const translationService = getTranslationService();
   // Reported from the same service the pipeline sends its requests with, so this
   // screen can never name a model the job would not actually use. Translation is
-  // NLLB only now, which has no model rotation behind it.
+  // Google Translate only now, which loads no model and has no rotation behind it.
   const translationFallbackModels = translationService.getFallbackModelNames().slice(1);
 
   const ttsInstance = getTTSProvider();
@@ -56,8 +56,8 @@ router.get('/status', async (req: Request, res: Response) => {
       provider: translationService.getProviderName(),
       model: translationService.getModelName(),
       fallbackModels: translationFallbackModels,
-      // NLLB is the only translator, so there is no service to take over: this
-      // stays undefined and the panel draws no fallback line.
+      // Google Translate is the only translator, so there is no service to take
+      // over: this stays undefined and the panel draws no fallback line.
       fallbackProvider: translationService.getFallbackProviderName() ?? undefined,
     },
     stt: {
