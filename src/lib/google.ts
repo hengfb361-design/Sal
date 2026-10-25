@@ -37,6 +37,10 @@ export const CANONICAL_ORIGIN = 'https://aivideotranslate.dev';
  */
 const REGISTERED_ORIGINS = [
   CANONICAL_ORIGIN,
+  // The Render deployment the app actually runs on. It has to be listed here
+  // **and** in the OAuth client's "Authorized JavaScript origins" — Google
+  // refuses any other host with `origin_mismatch`.
+  'https://sal-juma.onrender.com',
   // The older Cloudflare Pages address keeps working for anyone still using it.
   'https://khmerdub-ai.pages.dev',
   'http://localhost:3000',
