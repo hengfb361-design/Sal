@@ -426,6 +426,11 @@ export class JobProcessor {
         });
       }
 
+      // Sync: a translated line is often longer than the slot it was spoken in,
+      // so any line that would run into the next one is pulled back into its slot
+      // here (time-stretch only, nothing cut). See AudioMixingService.
+      await AudioMixingService.fitDialogueToSlots(dialogueSegments);
+
       await db.saveSegments(jobId, dialogueSegments);
 
       // Voice-over only counts as usable when at least one line produced audio.

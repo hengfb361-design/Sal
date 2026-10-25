@@ -133,18 +133,27 @@ keep working.
 
 Set `subtitle: false` in a job's settings to leave the caption track out.
 
-## Voice timing
+## Voice timing (Sync)
 
-Every dubbed line is used exactly as the voice engine produced it. Nothing is sped
-up (`atempo`) or cut down to the length of the English line any more: that
-"make the audio match the video" pass ran one or two extra FFmpeg encodes on every
-single line, which was the slowest part of the whole job, and it chopped long
-sentences mid-syllable. Instead each line is simply placed at the timestamp
-where it was spoken (`adelay`), and a line that runs past its slot plays out —
-`amix` handles any overlap and the MP4 is still capped at the video's own length.
+Each line is placed at the timestamp where it was spoken (`adelay`), so every
+entry lands on the mouth it belongs to. A translated line is often longer than
+the source one — Khmer gTTS speech runs longer than the English it replaces — so
+one extra pass keeps the dub from talking over itself:
 
-The dubbed speech is therefore a little longer than the source at times, but the
-stages are much faster and nothing is sliced mid-word.
+- **Only overflowing lines are touched.** The sync pass compares each line with
+  the gap to the next spoken line; anything that already fits (or overruns by
+  less than 8%, which lands in the pause) is used exactly as gTTS produced it.
+- **Nothing is cut.** An overflowing line is time-stretched with `atempo` (pitch
+  preserved), capped at `DUB_SYNC_MAX_TEMPO` (1.75× by default), so it ends
+  before the next line starts. A line that even the cap cannot fit plays out as
+  before and `amix`/the render cap handle the rest.
+- The pass costs one short FFmpeg run per overflowing line — not per line — and
+  `DUB_SYNC_ENABLED=false` turns it off. Khmer gTTS speech often runs nearly
+  twice as long as the English it replaces, which is why the default cap is
+  1.75×: below that, dense dialogue still overlaps.
+
+The MP4 is still capped at the video's own length, so the file can never end a
+frame early or leave the last frames in silence.
 
 ## Required secrets
 
