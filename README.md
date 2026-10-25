@@ -80,6 +80,23 @@ Set `AUDIO_SEPARATOR_URL` to wherever Demucs runs:
 Translation and voice need no service to connect: both are the public Google
 endpoints described above, reached from the server's own HTTPS request.
 
+Google throttles a datacenter IP it does not recognise, and a free host shares
+its address with every other tenant on that machine — on Render every line came
+back `429`, which left the `2/2 lines could not be translated` warning and an
+English dub under Khmer captions. So the lines Google refuses are translated by
+**Groq** instead, with the same `GROQ_API_KEY` the speech-to-text step already
+needs: they are batched (~20 lines per request) and answered as JSON. Three
+refusals in a row mark Google as blocked for the next ten minutes, so the rest of
+the job does not spend four backoff rounds per line. A deployment without a Groq
+key still gets the keyless `api.mymemory.translated.net` fallback, and a line
+nothing could translate keeps its original text and says so in the job warning.
+
+Overrides: `GROQ_TRANSLATION_MODEL` (default: the first of
+`llama-3.3-70b-versatile`, `openai/gpt-oss-120b`, `llama-3.1-8b-instant` the
+account offers), `GROQ_TRANSLATION_LINES_PER_CALL`,
+`GOOGLE_TRANSLATE_HOSTS`, `GOOGLE_TRANSLATE_FALLBACK=off`,
+`GOOGLE_TRANSLATE_BLOCK_MS`.
+
 Colab is the fast option: the same `demucs_api.py` runs on a free GPU, so the API
 answers with `"device":"cuda"` and the pipeline then sends it far bigger pieces
 (`AUDIO_SEPARATOR_GPU_CHUNK_SECONDS`, 90s by default) instead of the 15s pieces a

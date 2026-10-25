@@ -1,6 +1,7 @@
 import { DialogueSegment, JobSettings, TargetLanguage } from '../types.js';
 import { logger } from '../utils/logger.js';
 import { googleTargetCode, translateLines } from './googleTranslate.js';
+import { isGroqTranslationConfigured, translateLinesWithGroq } from './groqTranslate.js';
 
 export interface TranslationResult {
   segments: DialogueSegment[];
@@ -20,11 +21,14 @@ export type TranslationProgressCallback = (
 
 /**
  * Translation runs on Google Translate, reached over HTTPS with no key and no
- * model download — the same service the Python `googletrans` package uses. It is
- * the only translator the pipeline has, so there is never a fallback provider to
- * name.
+ * model download — the same service the Python `googletrans` package uses.
+ *
+ * Google refuses whole datacenter IP ranges with 429, so the lines it refuses are
+ * handed to Groq (whose key the speech-to-text step already needs) and, failing
+ * that, to a keyless public service. `translateDialogue` therefore names both
+ * engines: Google first, Groq when Google is blocked.
  */
-export type TranslationProviderName = 'googletrans';
+export type TranslationProviderName = 'googletrans' | 'groq';
 
 /** What the settings panel calls the engine. */
 export const GOOGLE_TRANSLATE_MODEL = 'google-translate (googletrans)';
@@ -199,9 +203,9 @@ export class KhmerDubTranslationService {
     return [];
   }
 
-  /** Google Translate is the only translator, so nothing takes over when it fails. */
+  /** Groq takes over the lines Google refuses, when its key is configured. */
   public getFallbackProviderName(): TranslationProviderName | null {
-    return null;
+    return isGroqTranslationConfigured() ? 'groq' : null;
   }
 
   /**
@@ -251,6 +255,12 @@ export class KhmerDubTranslationService {
         targetLanguage: settings.targetLanguage,
         concurrency: this.getConcurrency(),
         onLineDone: onProgress ? (completed, total) => onProgress(completed, total) : undefined,
+        // Google refused these lines (a throttled IP does that to all of them at
+        // once), so the deployment's own Groq key finishes the job.
+        fallback: isGroqTranslationConfigured()
+          ? (refused) =>
+              translateLinesWithGroq(refused, settings.sourceLanguage, settings.targetLanguage)
+          : undefined,
       }
     );
 
@@ -303,7 +313,7 @@ export class KhmerDubTranslationService {
     const missing = ordered.length - translations.size;
     if (missing > 0) {
       warnings.push(
-        `បន្ទាត់ចំនួន ${missing}/${ordered.length} មិនអាចបកប្រែដោយ Google Translate បានទេ ដូច្នេះវារក្សាអក្សរដើម។ (${missing} of ${ordered.length} line(s) could not be translated by Google Translate; they keep the original text.)`
+        `បន្ទាត់ចំនួន ${missing}/${ordered.length} មិនអាចបកប្រែបានទេ ដូច្នេះវារក្សាអក្សរដើម។ (${missing} of ${ordered.length} line(s) could not be translated; they keep the original text.)`
       );
     }
 
@@ -313,7 +323,7 @@ export class KhmerDubTranslationService {
       )} with Google Translate, ${this.getConcurrency()} at a time, ${(
         (Date.now() - startedAt) /
         1000
-      ).toFixed(1)}s.`
+      ).toFixed(1)}s${isGroqTranslationConfigured() ? ' (Groq for refused lines)' : ''}.`
     );
 
     return { segments: translatedSegments, warnings };

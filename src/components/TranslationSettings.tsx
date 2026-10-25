@@ -14,8 +14,8 @@ interface TranslationSettingsProps {
    */
   engine?: string | null;
   /**
-   * The service that takes over when `engine` fails a line, when there is one.
-   * Google Translate is the only translator, so this is normally absent.
+   * The service that takes over the lines `engine` refuses, when there is one —
+   * Groq, on a host whose IP Google throttles.
    */
   engineFallback?: string | null;
 }

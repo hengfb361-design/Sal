@@ -320,22 +320,6 @@ export async function translateLine(
   if (!skipGoogle) {
     rememberBlock(lastError instanceof GoogleTranslateError ? lastError.status : undefined);
   }
-  // Google refused every host for this line — ask the separate service rather
-  // than leaving the line in the source language.
-  if (FALLBACK_ENABLED) {
-    try {
-      const translated = await requestMyMemory(clean, source, target);
-      logger.warn(
-        `Google Translate refused a line; translated it with the ${FALLBACK_HOST} fallback instead.`
-      );
-      return translated;
-    } catch (fallbackError: any) {
-      logger.warn(
-        `Translation fallback failed too: ${fallbackError?.message ?? fallbackError}`
-      );
-    }
-  }
-
   throw lastError instanceof Error
     ? lastError
     : new GoogleTranslateError('Google Translate failed.', true);
@@ -347,6 +331,12 @@ export interface TranslateLinesOptions {
   concurrency?: number;
   /** Called once per finished line, whatever the outcome. */
   onLineDone?: (completed: number, total: number) => void | Promise<void>;
+  /**
+   * Asked for the lines Google refused, before the keyless last resort. This is
+   * where a translator reached with the deployment's own credentials goes, so a
+   * blocked Google IP does not leave a job in the source language.
+   */
+  fallback?: (lines: { id: string; text: string }[]) => Promise<Map<string, string>>;
 }
 
 /**
@@ -374,16 +364,57 @@ export async function translateLines(
   );
 
   let completed = 0;
+  const refused: { id: string; text: string }[] = [];
+
   await mapWithConcurrency(lines, concurrency, async (line) => {
     try {
       const translated = await translateLine(line.text, options.sourceLanguage, options.targetLanguage);
       if (translated) out.set(line.id, translated);
+      else refused.push(line);
     } catch (err: any) {
+      refused.push(line);
       logger.warn(`Google Translate could not translate line ${line.id}: ${err?.message ?? err}`);
     }
     completed++;
     if (options.onLineDone) await options.onLineDone(completed, lines.length);
   });
+
+  if (refused.length === 0) return out;
+
+  // The service the deployment pays for, when it has one.
+  if (options.fallback) {
+    try {
+      const rescued = await options.fallback(refused);
+      for (const [id, text] of rescued) {
+        if (text.trim()) out.set(id, text);
+      }
+    } catch (err: any) {
+      logger.warn(`Translation fallback failed: ${err?.message ?? err}`);
+    }
+  }
+
+  // Whatever is still missing gets one more chance from the keyless service, so a
+  // deployment without a Groq key is no worse off than before.
+  const stillMissing = refused.filter((line) => !out.has(line.id));
+  if (stillMissing.length > 0 && FALLBACK_ENABLED) {
+    const source = googleSourceCode(options.sourceLanguage);
+    const target = googleTargetCode(options.targetLanguage);
+    await mapWithConcurrency(stillMissing, Math.min(concurrency, 4), async (line) => {
+      try {
+        const translated = await requestMyMemory(
+          line.text.replace(/\s+/g, ' ').trim(),
+          source,
+          target
+        );
+        out.set(line.id, translated);
+        logger.warn(
+          `Google Translate refused a line; translated it with the ${FALLBACK_HOST} fallback instead.`
+        );
+      } catch (err: any) {
+        logger.warn(`Translation fallback failed too: ${err?.message ?? err}`);
+      }
+    });
+  }
 
   return out;
 }
