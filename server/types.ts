@@ -1,10 +1,11 @@
 /**
  * Every state a run can be in. `detecting_speakers` is no longer reported —
  * speaker naming happens inside the Whisper pass — but it stays in the union
- * because jobs recorded before that change still carry it. `syncing` is gone
- * entirely: the dialogue track is placed and padded to the video's own length
- * while it is assembled, so measuring it in a stage of its own only added a
- * full-length audio pass to every job.
+ * because jobs recorded before that change still carry it. `syncing` reports
+ * the timing pass: the short per-line time-stretch that pulls a dubbed line back
+ * into the slot it was spoken in (`AudioMixingService.fitDialogueToSlots`), so
+ * the studio can show sync as a row of its own. It is not the old full-length
+ * measuring pass — that was removed and never came back.
  */
 export type JobStatus =
   | 'queued'
@@ -15,6 +16,7 @@ export type JobStatus =
   | 'detecting_speakers'
   | 'translating'
   | 'generating_voice'
+  | 'syncing'
   | 'mixing'
   | 'rendering'
   | 'quality_check'

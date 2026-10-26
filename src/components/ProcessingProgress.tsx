@@ -18,25 +18,29 @@ interface StepItem {
 /**
  * The pipeline the studio actually runs, in order:
  *
- *   Upload Video → Demucs API → Speech-to-Text → Google Translate
- *   (then: gTTS voice + subtitle track, and the final FFmpeg sync/mix/render)
+ *   Upload Video → Demucs API → Speech-to-Text → Translate → Dubbed Voice
+ *   → Sync + Final MP4
  *
- * Four rows, one per stage the owner wants on screen: the Khmer line names what
- * the stage does, the line under it names the engine that does it. Each row owns
- * every status the server reports inside that step, which is what keeps the
- * checklist lighting up from top to bottom as the job moves.
+ * Six rows, one per stage: the Khmer line names what the stage does, the line
+ * under it names the engine that does it. Each row owns every status the server
+ * reports inside that step, which is what keeps the checklist lighting up from
+ * top to bottom as the job moves.
  *
- * The last two steps of the run — writing the subtitles and the Khmer voice, and
- * mixing/rendering the final MP4 — still happen exactly as before; they are no
- * longer listed as rows of their own, so `LATE_STATUSES` covers their statuses:
- * when the job is inside one of them every row above is already finished, and
- * the overall progress bar is where that remaining work is visible.
+ * The last row carries the closing statuses — the sync pass that pulls each
+ * dubbed line back into the slot it was spoken in, the mix under the music, the
+ * final H.264/AAC render and the quality check — because they are all FFmpeg
+ * writing the one deliverable, and sync is the part the owner asked to see.
+ * `failed` is deliberately owned by no row: a run that died must not light the
+ * whole list up green.
  *
  * The dialogue is translated by Google Translate (the keyless public endpoint the
- * `googletrans` package uses — no model is downloaded), so row 4 names it. The
- * speech-to-text step runs on Groq Whisper, and the dub is spoken by gTTS (Google
- * Translate's own text-to-speech); FFmpeg then places every line on its timestamp
- * and muxes the result back into the video on the server itself.
+ * `googletrans` package uses — no model is downloaded); a line that endpoint
+ * refuses goes to Groq — whose key the speech-to-text step already needs — and,
+ * without that, to a keyless public service, so a blocked Google IP no longer
+ * leaves the dub in the source language. The speech-to-text step runs on Groq
+ * Whisper and the dub is spoken by gTTS (Google Translate's own text-to-speech);
+ * FFmpeg then syncs every line to its timestamp and muxes the result back into
+ * the video on the server itself.
  */
 const PIPELINE_STAGES: StepItem[] = [
   {
@@ -60,25 +64,21 @@ const PIPELINE_STAGES: StepItem[] = [
   {
     id: 'translating',
     khmer: 'បកប្រែអត្ថបទទៅភាសាគោលដៅ',
-    english: 'Google Translate',
+    english: 'Google Translate (+ Groq fallback)',
     associatedStatuses: ['translating'],
   },
-];
-
-/**
- * Statuses of the two closing steps that no longer have a row of their own.
- *
- * They still run — the subtitles, the Khmer voice and the final MP4 come from
- * them — but the checklist shows only the stages above, so a job sitting in one
- * of these is past every visible row: all of them read as finished while the
- * progress bar carries the rest. `failed` is deliberately absent: a run that
- * died must not light the whole list up green.
- */
-const LATE_STATUSES: JobStatus[] = [
-  'generating_voice',
-  'mixing',
-  'rendering',
-  'quality_check',
+  {
+    id: 'generating_voice',
+    khmer: 'បង្កើតសំឡេងបកប្រែ',
+    english: 'Dubbed Voice (gTTS)',
+    associatedStatuses: ['generating_voice'],
+  },
+  {
+    id: 'syncing',
+    khmer: 'តម្រឹមសំឡេង និងបញ្ចូលវីដេអូ',
+    english: 'Sync + Final MP4 (FFmpeg)',
+    associatedStatuses: ['syncing', 'mixing', 'rendering', 'quality_check'],
+  },
 ];
 
 /**
@@ -86,7 +86,7 @@ const LATE_STATUSES: JobStatus[] = [
  * said under the list so it travels with what it describes.
  */
 const ENGINE_NOTE =
-  'ការញែកសំឡេងប្រើ Demucs ការស្តាប់ចាប់អក្សរប្រើ ASR (Groq Whisper) ការបកប្រែប្រើ Google Translate (googletrans — គ្មានការ download ម៉ូដែល) សំឡេងបកប្រែបង្កើតដោយ gTTS ហើយ FFmpeg តម្រឹមសំឡេងជាមួយវីដេអូ និងបញ្ចូលជាឯកសារចុងក្រោយ។ (Voices are split by Demucs, speech is transcribed by ASR (Groq Whisper), translated by Google Translate (googletrans — no model download), spoken by gTTS, then FFmpeg syncs and muxes the final file.)';
+  'ការញែកសំឡេងប្រើ Demucs ការស្តាប់ចាប់អក្សរប្រើ ASR (Groq Whisper) ការបកប្រែប្រើ Google Translate (googletrans — គ្មានការ download ម៉ូដែល) ហើយបន្ទាត់ដែល Google បដិសេធ Groq បកប្រែជំនួស សំឡេងបកប្រែបង្កើតដោយ gTTS ហើយ FFmpeg តម្រឹមសំឡេងនិងបញ្ចូលជាឯកសារចុងក្រោយ។ (Voices are split by Demucs, speech is transcribed by ASR (Groq Whisper), translated by Google Translate (googletrans — no model download) with Groq taking over refused lines, spoken by gTTS, then FFmpeg syncs and muxes the final file.)';
 
 export const ProcessingProgress: React.FC<ProcessingProgressProps> = ({ job, onRetry }) => {
   const currentStatus = job.status;
@@ -123,11 +123,9 @@ export const ProcessingProgress: React.FC<ProcessingProgressProps> = ({ job, onR
 
     const currentStageIndex = PIPELINE_STAGES.findIndex(s => s.associatedStatuses.includes(currentStatus));
 
-    // The status belongs to one of the unlisted closing steps: every row this
-    // checklist shows is already behind the job.
-    if (currentStageIndex === -1) {
-      return LATE_STATUSES.includes(currentStatus) ? 'completed' : 'pending';
-    }
+    // Every non-terminal status the server reports is owned by a row, so the
+    // only status left here is `queued`: nothing on screen has started yet.
+    if (currentStageIndex === -1) return 'pending';
 
     const thisStageIndex = PIPELINE_STAGES.indexOf(stage);
     if (currentStageIndex > thisStageIndex) return 'completed';

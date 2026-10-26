@@ -46,6 +46,7 @@ export const KHMER_STEP_MESSAGES: Record<JobStatus, string> = {
   detecting_speakers: 'កំពុងកំណត់អត្តសញ្ញាណអ្នកនិយាយ...',
   translating: 'កំពុងបកប្រែអត្ថបទទៅភាសាគោលដៅ (Google Translate)...',
   generating_voice: 'កំពុងបង្កើតសំឡេងពីអក្សរ (gTTS)...',
+  syncing: 'កំពុងតម្រឹមសំឡេងបកប្រែជាមួយវីដេអូ (Sync)...',
   mixing: 'កំពុងដាក់សំឡេងខ្មែរចូលវីដេអូ ជាមួយភ្លេងផ្ទៃខាងក្រោយ...',
   rendering: 'កំពុងដាក់សំឡេងខ្មែរចូលវីដេអូ — Render MP4 ចុងក្រោយ (H.264/AAC)...',
   quality_check: 'កំពុងត្រួតពិនិត្យវីដេអូចុងក្រោយ...',
@@ -62,6 +63,7 @@ export const ENGLISH_STEP_MESSAGES: Record<JobStatus, string> = {
   detecting_speakers: 'Identifying speakers and vocal characteristics...',
   translating: 'Google Translate: translating the dialogue...',
   generating_voice: 'gTTS: generating the dubbed voice from the translated text...',
+  syncing: 'Sync: pulling each dubbed line back into the slot it was spoken in...',
   mixing: 'Writing the Khmer voice back into the video, under the music...',
   rendering: 'Writing the Khmer voice back into the video: final H.264/AAC MP4...',
   quality_check: 'Checking the finished video...',
@@ -70,10 +72,10 @@ export const ENGLISH_STEP_MESSAGES: Record<JobStatus, string> = {
 };
 
 /**
- * Progress percentage mapping, spread across the four stages the studio shows:
+ * Progress percentage mapping, in the order the studio's checklist lists the
+ * stages:
  *
- *   Upload → Demucs → Speech-to-Text → Google Translate
- *   (then the closing steps: subtitles + gTTS voice, and the final render)
+ *   Upload → Demucs → Speech-to-Text → Translate → Dubbed Voice → Sync + Render
  *
  * `detecting_speakers` is no longer reported — speaker naming happens inside the
  * Whisper pass — but it stays in the map because jobs recorded before that change
@@ -88,6 +90,7 @@ const STATUS_PROGRESS: Record<JobStatus, number> = {
   detecting_speakers: 48,
   translating: 56,
   generating_voice: 68,
+  syncing: 79,
   mixing: 84,
   rendering: 92,
   quality_check: 97,
@@ -428,7 +431,10 @@ export class JobProcessor {
 
       // Sync: a translated line is often longer than the slot it was spoken in,
       // so any line that would run into the next one is pulled back into its slot
-      // here (time-stretch only, nothing cut). See AudioMixingService.
+      // here (time-stretch only, nothing cut). See AudioMixingService. It runs as
+      // a stage of its own so the studio's checklist shows sync while it works.
+      await this.throwIfCancelled(jobId);
+      await this.updateJobState(jobId, 'syncing');
       await AudioMixingService.fitDialogueToSlots(dialogueSegments);
 
       await db.saveSegments(jobId, dialogueSegments);

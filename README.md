@@ -31,13 +31,14 @@ Six engines, in the order they run:
 | 1. Upload Video | upload + FFmpeg audio extraction |
 | 2. Demucs | Demucs (remote stem API) — ញែកសំឡេងនិយាយចេញពីតន្ត្រី/ផ្ទៃខាងក្រោយ |
 | 3. ASR | Whisper via Groq `whisper-large-v3` — បំលែងសំឡេងទៅជាអក្សរ |
-| 4. Google Translate | the free `translate_a/single` endpoint — the same one the Python `googletrans` package uses. **No API key and no model download**: each line is one HTTPS request, translated into the **target language** the studio picked (Khmer by default). Transcript fragments Whisper split mid-sentence are rejoined first, and a **Khmer** target is sanitised (no Thai/Lao); any other target keeps its own script untouched |
+| 4. Google Translate | the free `translate_a/single` endpoint — the same one the Python `googletrans` package uses. **No API key and no model download**: each line is one HTTPS request, translated into the **target language** the studio picked (Khmer by default). Transcript fragments Whisper split mid-sentence are rejoined first, and a **Khmer** target is sanitised (no Thai/Lao); any other target keeps its own script untouched. A line the endpoint refuses (Google blocks whole datacenter IP ranges with 429) is handed to **Groq** — the same key the ASR step uses — and, without that, to the keyless MyMemory service, so a blocked IP no longer leaves the dub in the source language |
 | 5. gTTS | Google Translate's own `translate_tts` endpoint — what the `gTTS` package wraps. Keyless, no voice model, one MP3 per request (a long line is cut at punctuation into ≤180-character pieces and joined back into one WAV) |
 | 6. Sync + FFmpeg | every line is placed on the timestamp where it was spoken (`adelay`), mixed under the kept music/background, and muxed back into the video as the final MP4 |
 
-The studio's checklist shows the first four rows — upload, Demucs, ASR and
-translate. The voice, the subtitle track and the final render run after them and
-the overall progress bar carries that work.
+The studio's checklist shows all six rows — upload, Demucs, ASR, translate, the
+dubbed voice and **Sync + Final MP4** — so the sync pass is on screen while it
+runs instead of hiding inside the voice stage. The subtitle track is written
+inside that last row and the overall progress bar carries the detail.
 
 Nothing is lost by not naming those closing steps. The voice is already in time
 when the mixer starts, and that costs nothing extra:
@@ -78,7 +79,9 @@ Set `AUDIO_SEPARATOR_URL` to wherever Demucs runs:
 | Bundled sidecar | `tools/audio-separator-server/` |
 
 Translation and voice need no service to connect: both are the public Google
-endpoints described above, reached from the server's own HTTPS request.
+endpoints described above, reached from the server's own HTTPS request. A line
+Google refuses goes to Groq when `GROQ_API_KEY` is set (it already is, for the
+ASR step), and to the keyless MyMemory service when it is not.
 
 Google throttles a datacenter IP it does not recognise, and a free host shares
 its address with every other tenant on that machine — on Render every line came
@@ -170,6 +173,9 @@ one extra pass keeps the dub from talking over itself:
   `DUB_SYNC_ENABLED=false` turns it off. Khmer gTTS speech often runs nearly
   twice as long as the English it replaces, which is why the default cap is
   1.75×: below that, dense dialogue still overlaps.
+- It runs as its own row in the studio's checklist (**តម្រឹមសំឡេង និងបញ្ចូលវីដេអូ ·
+  Sync + Final MP4**), so sync is visible while it works instead of hiding
+  inside the voice stage.
 
 The MP4 is still capped at the video's own length, so the file can never end a
 frame early or leave the last frames in silence.
@@ -180,7 +186,7 @@ Add these in **Settings → Variables and secrets** as **Secrets** (not variable
 
 | Name | Required | Notes |
 | --- | --- | --- |
-| `GROQ_API_KEY` | yes | [console.groq.com/keys](https://console.groq.com/keys) — speech-to-text only |
+| `GROQ_API_KEY` | yes | [console.groq.com/keys](https://console.groq.com/keys) — speech-to-text, and the translator for lines Google Translate refuses |
 | `GROQ_API_KEY2`, `GROQ_API_KEY3` | optional | Extra keys; the app rotates to them automatically on 401/429 |
 | `STT_PROVIDER` | optional | `groq` (default) |
 | `AUDIO_SEPARATOR_URL` | yes | Base URL of the Demucs stem service |
@@ -189,9 +195,11 @@ Add these in **Settings → Variables and secrets** as **Secrets** (not variable
 | `GOOGLE_TRANSLATE_CONCURRENCY` | optional | Lines translated at once (default 6) |
 | `TTS_CONCURRENCY` | optional | Lines voiced at once (default 3) |
 
-Translation and voice need **no key**: Google Translate and gTTS are called
-keylessly. `GOOGLE_TRANSLATE_ENABLED=false` / `GTTS_ENABLED=false` are the only
-switches, and they exist so a deployment can take those stages out on purpose.
+Translation and voice need **no key of their own**: Google Translate and gTTS are
+called keylessly, and the Groq key the ASR step already needs covers any line
+Google refuses. `GOOGLE_TRANSLATE_ENABLED=false` / `GTTS_ENABLED=false` are the
+only switches, and they exist so a deployment can take those stages out on
+purpose.
 
 The release encode is the slowest step on a free host, which has a fraction of
 one CPU, so its settings are chosen for that: the measurements behind
@@ -220,9 +228,12 @@ Cloudflare R2 / S3 bucket to persist them:
 - Translation and voice run on Google's public endpoints, so there is no Colab
   session to keep alive: the translate stage is always ready. Those endpoints are
   keyless but shared by IP, so a throttled request (429) is retried on a second
-  host with a short backoff and, if it still fails, that one line keeps the
-  original text and says so in the job warning. `GOOGLE_TRANSLATE_CONCURRENCY` and
-  `TTS_CONCURRENCY` lower the parallel requests if a host is being throttled.
+  host with a short backoff, a few refused requests in a row skip Google for the
+  next 10 minutes, and a line Google still refuses is translated by Groq (the key
+  the ASR step already needs) and, without that, by MyMemory. Only a line every
+  translator refused keeps the original text, and that says so in the job
+  warning. `GOOGLE_TRANSLATE_CONCURRENCY` and `TTS_CONCURRENCY` lower the
+  parallel requests if a host is being throttled.
 - Demucs is still the one service you must run somewhere (see above) and
   `GROQ_API_KEY` is still required for the ASR step.
 - Video processing is CPU-bound: a ~1 minute video takes roughly 1–3 minutes.
