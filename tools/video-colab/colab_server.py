@@ -393,6 +393,7 @@ def public_job(job: dict[str, Any]) -> dict[str, Any]:
         "progress": job["progress"],
         "prompt": job["prompt"],
         "translated_prompt": job.get("translated_prompt"),
+        "scene_count": len(job.get("scenes") or []),
         "negative_prompt": job["negative_prompt"],
         "width": job["width"],
         "height": job["height"],
@@ -430,10 +431,17 @@ def run_job(job_id: str) -> None:
 
         prompt = job["prompt"]
         final_prompt = prompt
-        if job["translate"]:
-            translated, _source = translate_text(prompt, SOURCE_LANG)
-            final_prompt = translated
-        if final_prompt.strip().lower() != prompt.strip().lower():
+        scenes = job.get("scenes") or []
+        scene_prompts: list[str] = []
+        if scenes:
+            # One prompt per scene; each scene is translated on its own.
+            for scene in scenes:
+                scene_prompts.append(translate_text(scene, SOURCE_LANG)[0] if job["translate"] else scene)
+            final_prompt = " ".join(scene_prompts)
+            update(job_id, translated_prompt=" · ".join(scene_prompts)[:400])
+        elif job["translate"]:
+            final_prompt = translate_text(prompt, SOURCE_LANG)[0]
+        if not scenes and final_prompt.strip().lower() != prompt.strip().lower():
             update(job_id, translated_prompt=final_prompt)
 
         update(job_id, stage="loading_model", progress=6)
@@ -457,8 +465,13 @@ def run_job(job_id: str) -> None:
         for segment_index in range(segments_total):
             update(job_id, segments_done=segment_index)
 
+            segment_prompt = (
+                scene_prompts[segment_index]
+                if segment_index < len(scene_prompts)
+                else final_prompt
+            )
             call_kwargs: dict[str, Any] = {
-                "prompt": final_prompt,
+                "prompt": segment_prompt,
                 "negative_prompt": job["negative_prompt"] or PROFILE.negative,
                 "num_inference_steps": total_steps,
                 "num_frames": frames_per_segment,
@@ -616,6 +629,9 @@ class GenerateRequest(BaseModel):
     guidance_scale: Optional[float] = Field(default=None, ge=1.0, le=20.0)
     seed: Optional[int] = None
     duration_seconds: Optional[int] = Field(default=None, ge=2, le=120)
+    # One prompt per scene (Google Flow style): each line becomes a ~6-7s shot,
+    # chained onto the previous shot's last frame with no visible cuts.
+    scenes: Optional[list[str]] = Field(default=None)
     translate: bool = True
 
 
@@ -687,9 +703,15 @@ def api_generate(payload: GenerateRequest) -> dict[str, Any]:
     # continuing from the last frame of the previous one, then stitched into
     # a single MP4 — one continuous take with no visible cuts.
     payload_duration = payload.duration_seconds
+    scene_list = [s.strip() for s in (payload.scenes or []) if s.strip()][:30]
+    using_scenes = len(scene_list) > 1 and PROFILE.i2v
     segments_total = 1
     frames_per_segment = snap_frames(payload.num_frames)
-    if payload_duration and PROFILE.i2v:
+    if using_scenes:
+        # Google Flow style: one ~6-7s shot per line (PROFILE.max_frames).
+        segments_total = len(scene_list)
+        frames_per_segment = PROFILE.max_frames
+    elif payload_duration and PROFILE.i2v:
         target_frames = payload_duration * PROFILE.fps
         segments_total = max(1, -(-target_frames // PROFILE.max_frames))
         frames_per_segment = snap_frames(
@@ -706,6 +728,7 @@ def api_generate(payload: GenerateRequest) -> dict[str, Any]:
         "progress": 0,
         "prompt": prompt,
         "translated_prompt": None,
+        "scenes": scene_list if using_scenes else [],
         "negative_prompt": payload.negative_prompt.strip(),
         "width": snap_size(payload.width),
         "height": snap_size(payload.height),
