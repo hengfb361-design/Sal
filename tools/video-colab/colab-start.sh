@@ -128,9 +128,15 @@ say "៥/៨ ទាញយក model (ប្រហែល ១៥–២០ GB · ធ
 if ! SERVER_PY="$SERVER_PY" VIDEO_PROFILE="$PROFILE" HF_TOKEN="${HF_TOKEN:-}" python3 - <<'PY'
 import importlib.util
 import os
+import sys
 
-spec = importlib.util.spec_from_file_location("khmerclip_backend", os.environ["SERVER_PY"])
+# សំខាន់៖ ត្រូវចុះ module ចូល sys.modules មុន exec — បុីនៃការប្រើ @dataclass
+# គ្មានវា Python រក cls.__module__ ក្នុង sys.modules មិនឃើញ →
+# AttributeError: 'NoneType' object has no attribute '__dict__'។
+name = "khmerclip_backend"
+spec = importlib.util.spec_from_file_location(name, os.environ["SERVER_PY"])
 backend = importlib.util.module_from_spec(spec)
+sys.modules[name] = backend
 spec.loader.exec_module(backend)
 
 print(" profile :", backend.PROFILE.key, "—", backend.PROFILE.label)
@@ -147,7 +153,7 @@ for root, _dirs, files in os.walk(path):
 print(f" ✅ model ready · {total / 1e9:.1f} GB · {path}")
 PY
 then
-  echo "❌ ទាញយក model មិនចេញទេ — ពិនិត្យ internet / disk រួចសាកម្ដងទៀត"
+  echo "❌ ទាញយក model មិនចេញទេ — សូមអាន error/traceback ខាងលើ (ពិនិត្យ internet / disk ផង)"
   exit 1
 fi
 
