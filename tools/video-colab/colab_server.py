@@ -104,6 +104,9 @@ class Profile:
     vae_fp32: bool
     extra_decode: bool
     negative: str
+    # Supports continuing from the previous segment's last frame (used by long
+    # continuous videos). LTX-Video does this natively via image conditioning.
+    i2v: bool = False
 
 
 PROFILES: dict[str, Profile] = {
@@ -122,6 +125,7 @@ PROFILES: dict[str, Profile] = {
         guidance=5.0,
         vae_fp32=True,
         extra_decode=True,
+        i2v=True,
         negative="worst quality, inconsistent motion, blurry, jittery, distorted",
     ),
     # ~20 GB class model, much slower on T4 but very coherent motion.
@@ -393,6 +397,10 @@ def public_job(job: dict[str, Any]) -> dict[str, Any]:
         "width": job["width"],
         "height": job["height"],
         "num_frames": job["num_frames"],
+        "frames_per_segment": job.get("frames_per_segment", job["num_frames"]),
+        "segments_total": job.get("segments_total", 1),
+        "segments_done": job.get("segments_done", 0),
+        "duration_seconds": job.get("duration_seconds"),
         "fps": job["fps"],
         "num_inference_steps": job["num_inference_steps"],
         "seed": job.get("seed"),
@@ -401,6 +409,13 @@ def public_job(job: dict[str, Any]) -> dict[str, Any]:
         "elapsed_seconds": job.get("elapsed_seconds"),
         "created_at": job["created_at"],
     }
+
+
+def extract_frames(result: Any) -> Any:
+    frames = result.frames
+    if isinstance(frames, list) and frames and isinstance(frames[0], list):
+        frames = frames[0]
+    return frames
 
 
 def run_job(job_id: str) -> None:
@@ -424,49 +439,86 @@ def run_job(job_id: str) -> None:
         update(job_id, stage="loading_model", progress=6)
         pipe = load_pipeline()
 
-        seed = job.get("seed")
-        if seed is None:
-            seed = int(torch.randint(0, 2**31 - 1, (1,)).item())
-        update(job_id, seed=seed, stage="generating", progress=12)
-
-        generator = torch.Generator(device=DEVICE).manual_seed(int(seed))
-        call_kwargs: dict[str, Any] = {
-            "prompt": final_prompt,
-            "negative_prompt": job["negative_prompt"] or PROFILE.negative,
-            "num_inference_steps": job["num_inference_steps"],
-            "num_frames": job["num_frames"],
-            "height": job["height"],
-            "width": job["width"],
-            "guidance_scale": job["guidance_scale"],
-            "generator": generator,
-        }
+        base_seed = job.get("seed")
+        if base_seed is None:
+            base_seed = int(torch.randint(0, 2**31 - 1, (1,)).item())
+        update(job_id, seed=base_seed, stage="generating", progress=12)
 
         signature = inspect.signature(pipe.__call__).parameters
-        if PROFILE.extra_decode:
-            if "decode_timestep" in signature:
-                call_kwargs["decode_timestep"] = 0.05
-            if "decode_noise_scale" in signature:
-                call_kwargs["decode_noise_scale"] = 0.025
-
         total_steps = max(1, job["num_inference_steps"])
-        if "callback_on_step_end" in signature:
+        segments_total = max(1, int(job.get("segments_total") or 1))
+        frames_per_segment = int(job.get("frames_per_segment") or job["num_frames"])
+        if segments_total == 1:
+            frames_per_segment = int(job["num_frames"])
+        total_frames = max(1, int(job.get("num_frames") or 1))
 
-            def on_step(_pipe: Any, step_index: int, _timestep: Any, callback_kwargs: dict) -> dict:
-                update(job_id, progress=int(12 + 78 * (step_index + 1) / total_steps))
-                return callback_kwargs
+        stitched: list[Any] = []
+        frames_done = 0
+        for segment_index in range(segments_total):
+            update(job_id, segments_done=segment_index)
 
-            call_kwargs["callback_on_step_end"] = on_step
-            call_kwargs["callback_on_step_end_tensor_inputs"] = ["latents"]
+            call_kwargs: dict[str, Any] = {
+                "prompt": final_prompt,
+                "negative_prompt": job["negative_prompt"] or PROFILE.negative,
+                "num_inference_steps": total_steps,
+                "num_frames": frames_per_segment,
+                "height": job["height"],
+                "width": job["width"],
+                "guidance_scale": job["guidance_scale"],
+                "generator": torch.Generator(device=DEVICE).manual_seed(
+                    int(base_seed) + segment_index
+                ),
+            }
 
-        result = pipe(**call_kwargs)
+            if PROFILE.extra_decode:
+                if "decode_timestep" in signature:
+                    call_kwargs["decode_timestep"] = 0.05
+                if "decode_noise_scale" in signature:
+                    call_kwargs["decode_noise_scale"] = 0.025
 
-        frames = result.frames
-        if isinstance(frames, list) and frames and isinstance(frames[0], list):
-            frames = frames[0]
+            # Continuation: each segment after the first starts from the last
+            # frame of the previous one (image conditioning), so the final MP4
+            # plays as one continuous take with no visible cuts between segments.
+            if segment_index > 0 and PROFILE.i2v and "image" in signature:
+                try:
+                    import numpy as np
+                    from PIL import Image as PILImage
+
+                    anchor = stitched[-1][-1]
+                    call_kwargs["image"] = (
+                        anchor
+                        if isinstance(anchor, PILImage.Image)
+                        else PILImage.fromarray(np.asarray(anchor))
+                    )
+                except Exception as exc:
+                    print(f"[job {job_id}] image continuation unavailable: {exc!r}", flush=True)
+
+            if "callback_on_step_end" in signature:
+
+                def on_step(_pipe: Any, step_index: int, _timestep: Any, callback_kwargs: dict) -> dict:
+                    if segments_total == 1:
+                        update(job_id, progress=int(12 + 78 * (step_index + 1) / total_steps))
+                    else:
+                        done = frames_done + (step_index + 1) * frames_per_segment / total_steps
+                        update(
+                            job_id,
+                            progress=int(12 + 78 * min(1.0, done / total_frames)),
+                            segments_done=segment_index,
+                        )
+                    return callback_kwargs
+
+                call_kwargs["callback_on_step_end"] = on_step
+                call_kwargs["callback_on_step_end_tensor_inputs"] = ["latents"]
+
+            frames = extract_frames(pipe(**call_kwargs))
+            stitched.extend(frames)
+            frames_done += len(frames)
+            update(job_id, segments_done=segment_index + 1)
+            print(f"[job {job_id}] segment {segment_index + 1}/{segments_total} done", flush=True)
 
         update(job_id, stage="encoding", progress=92)
         filename = f"{job_id}.mp4"
-        export_video(frames, OUTPUT_DIR / filename)
+        export_video(stitched, OUTPUT_DIR / filename)
 
         update(
             job_id,
@@ -563,6 +615,7 @@ class GenerateRequest(BaseModel):
     num_inference_steps: int = Field(default=30, ge=4, le=60)
     guidance_scale: Optional[float] = Field(default=None, ge=1.0, le=20.0)
     seed: Optional[int] = None
+    duration_seconds: Optional[int] = Field(default=None, ge=2, le=120)
     translate: bool = True
 
 
@@ -607,6 +660,8 @@ def api_health() -> dict[str, Any]:
         "busy": busy,
         "queue_size": JOB_QUEUE.qsize(),
         "model_loaded": _PIPE is not None,
+        "long_video": PROFILE.i2v,
+        "max_duration_seconds": PROFILE.max_frames // PROFILE.fps,
     }
 
 
@@ -628,6 +683,21 @@ def api_generate(payload: GenerateRequest) -> dict[str, Any]:
     if not prompt:
         raise HTTPException(status_code=400, detail="Prompt is empty")
 
+    # Long mode: the video is generated segment by segment, each segment
+    # continuing from the last frame of the previous one, then stitched into
+    # a single MP4 — one continuous take with no visible cuts.
+    payload_duration = payload.duration_seconds
+    segments_total = 1
+    frames_per_segment = snap_frames(payload.num_frames)
+    if payload_duration and PROFILE.i2v:
+        target_frames = payload_duration * PROFILE.fps
+        segments_total = max(1, -(-target_frames // PROFILE.max_frames))
+        frames_per_segment = snap_frames(
+            min(PROFILE.max_frames, max(PROFILE.min_frames, -(-target_frames // segments_total)))
+        )
+        while segments_total * frames_per_segment < target_frames:
+            segments_total += 1
+
     job_id = uuid.uuid4().hex[:12]
     job: dict[str, Any] = {
         "id": job_id,
@@ -639,7 +709,11 @@ def api_generate(payload: GenerateRequest) -> dict[str, Any]:
         "negative_prompt": payload.negative_prompt.strip(),
         "width": snap_size(payload.width),
         "height": snap_size(payload.height),
-        "num_frames": snap_frames(payload.num_frames),
+        "num_frames": segments_total * frames_per_segment,
+        "frames_per_segment": frames_per_segment,
+        "segments_total": segments_total,
+        "segments_done": 0,
+        "duration_seconds": payload_duration if segments_total > 1 else None,
         "fps": PROFILE.fps,
         "num_inference_steps": max(payload.num_inference_steps, PROFILE.min_steps),
         "guidance_scale": payload.guidance_scale
