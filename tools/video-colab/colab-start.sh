@@ -21,7 +21,7 @@
 # PORT=8002                                   port (tunnel បញ្ជូនមក port នេះ)
 # API_TOKEN=<key ផ្ទាល់ខ្លួន>                  បើទទេ = បង្កើតថ្មីឱ្យស្វ័យប្រវត្តិ
 # VIDEO_HOME=/content/video-api               កន្លែងទុកឯកសារ
-# VIDEO_RAW=<raw repo dir>                    កន្លែងទាញ colab_server.py
+# VIDEO_URL=<url ទៅ colab_server.py>          កំណត់ផ្ទាល់ពីកន្លែងទាញ
 # HF_TOKEN=<hf token>                         បើ model ត្រូវការ token
 #
 # ⚠️ Colab/Kaggle ជាម៉ាស៊ីនបណ្តោះអាសន្ន៖ បិទ tab ឬទុក idle = session ដាច់ ហើយ URL ស្លាប់។
@@ -34,7 +34,9 @@ PROFILE="${VIDEO_PROFILE:-auto}"
 RAW_UPSTREAM="https://raw.githubusercontent.com/kitreaksa78-debug/Sal/main/tools/video-colab"
 RAW_FORK="https://raw.githubusercontent.com/hengfb361-design/Sal/main/tools/video-colab"
 RAW_MIRROR="https://raw.githubusercontent.com/hengfb361-design/khmerclip-video/main/tools/video-colab"
-RAW_LIST="${VIDEO_RAW:-} $RAW_UPSTREAM $RAW_FORK $RAW_MIRROR"
+RAW_MIRROR_SERVER="https://raw.githubusercontent.com/hengfb361-design/khmerclip-video/main/server"
+# សាកគ្រប់កន្លែងដែលអាចមានឯកសារ រហូតទាល់តែបាន (VIDEO_URL ជាការកំណត់ផ្ទាល់)
+SERVER_PY_URLS="${VIDEO_URL:-} $RAW_UPSTREAM/colab_server.py $RAW_FORK/colab_server.py $RAW_MIRROR/colab_server.py $RAW_MIRROR_SERVER/colab_server.py"
 DIR="${VIDEO_HOME:-}"
 if [ -z "$DIR" ]; then
   if [ -d /content ] && [ -w /content ]; then
@@ -98,16 +100,17 @@ elif [ -f "$DIR/project/server/colab_server.py" ]; then
   cp "$DIR/project/server/colab_server.py" "$SERVER_PY"
 else
   fetched=0
-  for base in $RAW_LIST; do
-    if curl -fsSL -o "$SERVER_PY.new" "$base/colab_server.py"; then
+  for src in $SERVER_PY_URLS; do
+    if curl -fsSL -o "$SERVER_PY.new" "$src"; then
       mv "$SERVER_PY.new" "$SERVER_PY"
-      echo " ទាញបានពី $base"
+      echo " ទាញបានពី $src"
       fetched=1
       break
     fi
   done
   if [ "$fetched" = "0" ]; then
-    echo "❌ ទាញ colab_server.py មិនបាន (សាកហើយ៖ $RAW_LIST)"
+    echo "❌ ទាញ colab_server.py មិនបាន — សាកហើយ៖"
+    for src in $SERVER_PY_URLS; do echo "     $src"; done
     echo "   ដាក់ colab_server.py ក្នុង repo ត្រង់ tools/video-colab/ ឬ upload មក $SERVER_PY"
     exit 1
   fi
