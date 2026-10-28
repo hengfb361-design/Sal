@@ -75,10 +75,44 @@ stop_mysql() {
     fi
 }
 
+configure_mpm() {
+    # Termux's Apache defaults to the threaded 'event' MPM, but PHP's module is
+    # built non-threadsafe (non-ZTS). Mixing them aborts startup with
+    # "Apache is running a threaded MPM, but your PHP Module is not compiled to be
+    # threadsafe" — so switch Apache to the prefork MPM.
+    local conf="$PREFIX/etc/apache2/httpd.conf"
+    MPM_CHANGED=0
+    [ -f "$conf" ] || return 0
+    local modpath
+    modpath=$(grep -oE '^[[:space:]]*LoadModule[[:space:]]+mpm_prefork_module[[:space:]]+[^[:space:]]+' "$conf" | awk '{print $3}' | head -1)
+    [ -n "$modpath" ] || modpath=$(grep -oE '^[[:space:]]*LoadModule[[:space:]]+mpm_(event|worker)_module[[:space:]]+[^[:space:]]+' "$conf" | awk '{print $3}' | head -1 | sed -E 's/mpm_(event|worker)/mpm_prefork/')
+    [ -n "$modpath" ] || modpath="libexec/apache2/mod_mpm_prefork.so"
+    if [ ! -e "$modpath" ] && [ ! -e "$PREFIX/$modpath" ]; then
+        warn "mod_mpm_prefork.so not found — cannot switch Apache to the prefork MPM"
+        return 1
+    fi
+    if grep -qE '^[[:space:]]*LoadModule[[:space:]]+mpm_(event|worker)_module' "$conf"; then
+        sed -i -E 's@^([[:space:]]*LoadModule[[:space:]]+mpm_(event|worker)_module.*)$@# \1@' "$conf"
+        MPM_CHANGED=1
+    fi
+    if ! grep -qE '^[[:space:]]*LoadModule[[:space:]]+mpm_prefork_module' "$conf"; then
+        printf "\n# PHP's module is non-threadsafe, so the prefork MPM is required.\nLoadModule mpm_prefork_module %s\n" "$modpath" >>"$conf"
+        MPM_CHANGED=1
+    fi
+    [ "$MPM_CHANGED" = "1" ] && ok "Apache MPM set to prefork (required by the PHP module)"
+    return 0
+}
+
 start_apache() {
+    configure_mpm || true
+    if [ "$MPM_CHANGED" = "1" ] && apache_running; then
+        info "Restarting Apache to apply the MPM change"
+        httpd -k stop >/dev/null 2>&1 || true
+        sleep 1
+    fi
     if apache_running; then ok "Apache already running"; return 0; fi
     info "Starting Apache"
-    httpd -k start || die "httpd failed to start (run 'httpd -k start' to see the error)"
+    httpd -k start || die "httpd failed to start — see the error above, or $PREFIX/var/log/apache2/error_log"
     local i
     for i in $(seq 1 20); do
         apache_running && { ok "Apache is up on port $PORT"; return 0; }
